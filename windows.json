@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "server": "agent.apj-acesso.com",
+      "port": 7000,
+      "apiPort": 80,
+      "serviceName": "RemoteBootstrapAgent",
+      "requestTimeoutSec": 10,
+      "heartbeatBootstrapPath": "/agents/bootstrap/heartbeat",
+      "installBootstrapPath": "/agents/bootstrap/install",
+      "heartbeatMinSeconds": 10,
+      "heartbeatMaxSeconds": 30,
+      "idleTimeoutSeconds": 60,
+      "remotePeerFps": 8,
+      "remotePeerQuality": 70,
+      "remotePeerMaxWidth": 1280,
+      "remotePeerIdlePauseSec": 120,
+      "verboseLogs": false,
+      "enabled": true
+    }
+  ]
+}
