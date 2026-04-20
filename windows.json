@@ -10,7 +10,7 @@
       "installBootstrapPath": "/agents/bootstrap/install",
       "heartbeatMinSeconds": 10,
       "heartbeatMaxSeconds": 30,
-      "idleTimeoutSeconds": 60,
+      "idleTimeoutSeconds": 600,
       "remotePeerFps": 8,
       "remotePeerQuality": 70,
       "remotePeerMaxWidth": 1280,
